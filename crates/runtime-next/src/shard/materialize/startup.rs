@@ -78,7 +78,7 @@ pub(super) struct Startup {
     pub shuffle_reader: shuffle::log::Reader,
 }
 
-pub(super) async fn run<R, L: crate::LogHandler>(
+pub(super) async fn run<R, P: crate::PublisherFactory, L: crate::LoggerFactory>(
     controller_rx: &mut R,
     controller_tx: &mpsc::UnboundedSender<tonic::Result<proto::Materialize>>,
     db: crate::shard::RocksDB,
@@ -87,7 +87,8 @@ pub(super) async fn run<R, L: crate::LogHandler>(
     mut leader_rx: tonic::Streaming<proto::Materialize>,
     leader_tx: mpsc::UnboundedSender<proto::Materialize>,
     log_level: ops::LogLevel,
-    service: &crate::shard::Service<L>,
+    logger: &L::Logger,
+    service: &crate::shard::Service<P, L>,
     shard_index: u32,
     shuffle_directory: String,
 ) -> anyhow::Result<Startup>
@@ -116,7 +117,6 @@ where
 
     let proto::Task {
         max_transactions: _,
-        preview: _,
         spec: spec_bytes,
         sqlite_vfs_uri: _,
         publisher_id: _,
@@ -245,7 +245,7 @@ where
         ..Default::default()
     };
     let (connector_tx, mut connector_rx, container, codec) =
-        super::connector::start(service, log_level, initial).await?;
+        super::connector::start(service, logger, log_level, initial).await?;
 
     // Read C:Opened from the connector.
     let verify = crate::verify("Materialize", "Opened", "connector");
