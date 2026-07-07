@@ -8,16 +8,14 @@
 //! as in production.
 use crate::local_specs;
 use anyhow::Context;
+use runtime_harness::drive::{self, segments};
 use runtime_next::shard::rocksdb;
+use tokio::sync::mpsc;
 
-mod capture_driver;
-mod derive_driver;
-mod driver;
 mod fixture;
 mod logger;
 mod publish;
-mod services;
-mod shards;
+mod shuffle_factory;
 
 #[derive(Debug, clap::Args)]
 #[clap(rename_all = "kebab-case")]
@@ -111,12 +109,7 @@ pub struct Preview {
 /// materializations / derivations, the leader) Service. The logger carries the
 /// `--output-state` / `--output-apply` behavior the legacy `flowctl preview`
 /// flags expressed; the publisher captures captured / derived documents.
-#[derive(Clone)]
-struct Controls {
-    initial_state_json: bytes::Bytes,
-    publisher_factory: publish::PreviewPublisherFactory,
-    logger_factory: logger::PreviewLoggerFactory,
-}
+type Controls = drive::Controls<publish::PreviewPublisherFactory, logger::PreviewLoggerFactory>;
 
 /// Resolved task selected from the source specifications.
 enum TaskSpec {
@@ -173,7 +166,7 @@ impl Preview {
                 bytes::Bytes::from(initial_state.get().to_string())
             }
         };
-        let controls = Controls {
+        let controls = drive::Controls {
             initial_state_json,
             publisher_factory: publish::PreviewPublisherFactory,
             logger_factory: logger::PreviewLoggerFactory::new(
@@ -216,14 +209,14 @@ impl Preview {
                 if let Some(delay) = delay {
                     set_min_txn_duration(spec.shard_template.as_mut(), delay);
                 }
-                let run = services::Run::start_capture(
+                let run = drive::services::Run::start_capture(
                     network.clone(),
                     *shards,
                     *debug_port,
                     ctx.registry.clone(),
                 )
                 .await?;
-                let session_loop = capture_driver::run_sessions(
+                let session_loop = drive::capture_driver::run_sessions(
                     &run,
                     &spec,
                     session_targets,
@@ -235,15 +228,13 @@ impl Preview {
                 finish_output_state(&run, *output_state, result).await
             }
             TaskSpec::Materialization(mut spec) => {
-                let run = services::Run::start_with_shuffle_leader(
+                let (run, frontier_tx) = start_shuffle_leader_run(
                     ctx,
                     network.clone(),
                     *shards,
                     *debug_port,
-                    ctx.registry.clone(),
                     fixture.is_some(),
-                    controls.publisher_factory.clone(),
-                    controls.logger_factory.clone(),
+                    &controls,
                 )
                 .await?;
 
@@ -260,10 +251,11 @@ impl Preview {
                         fixture,
                         delay,
                         session_targets,
+                        frontier_tx.as_ref(),
                         &stop_token,
                     )?;
 
-                let session_loop = driver::run_sessions(
+                let session_loop = drive::driver::run_sessions(
                     &run,
                     &spec,
                     session_targets,
@@ -277,15 +269,13 @@ impl Preview {
                 finish_output_state(&run, *output_state, result).await
             }
             TaskSpec::Derivation(mut spec) => {
-                let run = services::Run::start_with_shuffle_leader(
+                let (run, frontier_tx) = start_shuffle_leader_run(
                     ctx,
                     network.clone(),
                     *shards,
                     *debug_port,
-                    ctx.registry.clone(),
                     fixture.is_some(),
-                    controls.publisher_factory.clone(),
-                    controls.logger_factory.clone(),
+                    &controls,
                 )
                 .await?;
 
@@ -304,10 +294,11 @@ impl Preview {
                         fixture,
                         delay,
                         session_targets,
+                        frontier_tx.as_ref(),
                         &stop_token,
                     )?;
 
-                let session_loop = derive_driver::run_sessions(
+                let session_loop = drive::derive_driver::run_sessions(
                     &run,
                     &spec,
                     session_targets,
@@ -326,6 +317,87 @@ impl Preview {
         // RocksDB / shuffle-log tempdirs.
         result
     }
+}
+
+/// Build the `Run` (tonic server + tempdirs) for a materialization or
+/// derivation preview, choosing its shuffle source. A fixture run installs the
+/// shared channel-fed [`segments::FixtureOpener`] and returns its frontier
+/// sender (the fixture feeder pushes checkpoint frontiers to it); a live run
+/// installs a loopback `shuffle::Service` reading real journals, which requires
+/// a logged-in token and yields no sender.
+async fn start_shuffle_leader_run(
+    ctx: &crate::CliContext,
+    network: String,
+    shards: u32,
+    debug_port: Option<u16>,
+    is_fixture: bool,
+    controls: &Controls,
+) -> anyhow::Result<(
+    drive::services::Run,
+    Option<mpsc::UnboundedSender<segments::FixtureItem>>,
+)> {
+    let registry = ctx.registry.clone();
+    let publisher_factory = controls.publisher_factory.clone();
+    let logger_factory = controls.logger_factory.clone();
+
+    if is_fixture {
+        let (opener, frontier_tx) = segments::fixture_opener();
+        let run = drive::services::Run::start_with_shuffle_leader(
+            network,
+            shards,
+            debug_port,
+            registry,
+            publisher_factory,
+            logger_factory,
+            move |_peer_endpoint| {
+                Ok((
+                    shuffle_factory::PreviewShuffleFactory::Fixture(opener),
+                    None,
+                ))
+            },
+        )
+        .await?;
+        return Ok((run, Some(frontier_tx)));
+    }
+
+    anyhow::ensure!(
+        ctx.access_token().is_some(),
+        "you must be logged in to preview. Try `flowctl auth login`"
+    );
+
+    // Share the live, auto-refreshing user-token watch so a long-lived preview
+    // re-mints collection authorizations with a currently-valid access token and
+    // survives rotation of both token layers.
+    let rest = ctx.rest.clone();
+    let router = ctx.router.clone();
+    let user_tokens = ctx.user_tokens.clone();
+
+    let run = drive::services::Run::start_with_shuffle_leader(
+        network,
+        shards,
+        debug_port,
+        registry.clone(),
+        publisher_factory,
+        logger_factory,
+        move |peer_endpoint| {
+            let factory =
+                flow_client_next::workflows::user_collection_auth::new_journal_client_factory(
+                    rest,
+                    models::Capability::Read,
+                    router,
+                    user_tokens,
+                );
+            let svc = shuffle::Service::new_loopback(peer_endpoint.to_string(), factory, registry);
+            Ok((
+                shuffle_factory::PreviewShuffleFactory::Live(
+                    runtime_next::ShuffleServiceFactory::new(svc.clone()),
+                ),
+                Some(svc),
+            ))
+        },
+    )
+    .await?;
+    Ok((run, None))
 }
 
 /// Fixture state held for the life of the session loop. Both variants keep
@@ -355,13 +427,14 @@ enum FixtureKeepalive {
 /// `--delay` (if any) as the task's minimum transaction duration, batching live
 /// reads into fewer, larger transactions.
 fn prepare_sessions<S>(
-    run: &services::Run,
+    run: &drive::services::Run,
     spec: &mut S,
     shard_template: impl FnOnce(&mut S) -> Option<&mut proto_gazette::consumer::ShardSpec>,
     build_task: impl FnOnce(&S) -> shuffle::proto::Task,
     fixture: Option<&str>,
     delay: Option<std::time::Duration>,
     session_targets: Vec<u32>,
+    frontier_tx: Option<&mpsc::UnboundedSender<segments::FixtureItem>>,
     stop_token: &tokio_util::sync::CancellationToken,
 ) -> anyhow::Result<(
     Vec<u32>,
@@ -379,15 +452,15 @@ fn prepare_sessions<S>(
     force_single_transaction(shard_template(spec));
     let task = build_task(spec);
 
+    let frontier_tx = frontier_tx
+        .expect("fixture run was started with a frontier sender")
+        .clone();
+
     if is_streaming_fixture(path)? {
         anyhow::ensure!(
             session_targets == [0],
             "a streaming --fixture (FIFO or stdin) runs exactly one unbounded session; omit --sessions or pass `--sessions -1`",
         );
-        let frontier_tx = run
-            .frontier_tx
-            .clone()
-            .expect("fixture run was started with a frontier sender");
 
         let session_stop = stop_token.child_token();
         let hold = tokio_util::sync::CancellationToken::new();
@@ -412,7 +485,7 @@ fn prepare_sessions<S>(
         ));
     }
 
-    let (targets, dirs, plan) = start_fixtures(run, task, path, session_targets)?;
+    let (targets, dirs, plan) = start_fixtures(run, task, path, &frontier_tx, session_targets)?;
     Ok((
         targets,
         dirs,
@@ -464,7 +537,7 @@ async fn finish_fixtures(
 /// A successful session result is replaced by a final-state read error; a failed
 /// session result passes through unchanged (skip the final-state read).
 async fn finish_output_state(
-    run: &services::Run,
+    run: &drive::services::Run,
     output_state: bool,
     result: anyhow::Result<()>,
 ) -> anyhow::Result<()> {
@@ -480,7 +553,7 @@ async fn finish_output_state(
 /// drops its `RocksDB` handle (releasing the exclusive lock) when its request
 /// stream ends, which is strictly before its response stream reaches EOF — and
 /// the session loop only returns once the driver has drained that EOF.
-async fn emit_final_connector_state(run: &services::Run) -> anyhow::Result<()> {
+async fn emit_final_connector_state(run: &drive::services::Run) -> anyhow::Result<()> {
     let state = read_preview_state(proto_flow::runtime::RocksDbDescriptor {
         rocksdb_path: run.rocksdb_path.clone(),
         rocksdb_env_memptr: 0,
@@ -489,20 +562,6 @@ async fn emit_final_connector_state(run: &services::Run) -> anyhow::Result<()> {
     .context("reading final connector state for --output-state")?;
 
     logger::emit_final_state(&state);
-    Ok(())
-}
-
-/// Seed shard zero's RocksDB at `descriptor` with `initial_state_json` as the
-/// connector-state base, then close it. Called for `--initial-state` before the
-/// runtime opens the same path via its SessionLoop, so the runtime recovers the
-/// seeded state on its first scan exactly as if a prior connector session had
-/// persisted it. Production has no equivalent: the runtime seeds `{}` itself.
-async fn seed_preview_state(
-    descriptor: proto_flow::runtime::RocksDbDescriptor,
-    initial_state_json: &[u8],
-) -> anyhow::Result<()> {
-    let db = rocksdb::RocksDB::open(Some(descriptor)).await?;
-    _ = db.put_connector_state_base(initial_state_json).await?;
     Ok(())
 }
 
@@ -575,9 +634,10 @@ fn force_single_transaction(shard_template: Option<&mut proto_gazette::consumer:
 /// Returns fixture-bounded session targets, the per-session shuffle directories
 /// (for the drivers' `Join`s), and the plan to keep alive for the run.
 fn start_fixtures(
-    run: &services::Run,
+    run: &drive::services::Run,
     task: shuffle::proto::Task,
     fixture_path: &str,
+    frontier_tx: &mpsc::UnboundedSender<segments::FixtureItem>,
     requested_targets: Vec<u32>,
 ) -> anyhow::Result<(Vec<u32>, Vec<String>, fixture::FixturePlan)> {
     let mut plan = fixture::build(
@@ -590,10 +650,7 @@ fn start_fixtures(
     let session_dirs = plan.session_dirs.clone();
     let session_frontiers = std::mem::take(&mut plan.session_frontiers);
 
-    let frontier_tx = run
-        .frontier_tx
-        .clone()
-        .expect("fixture run was started with a frontier sender");
+    let frontier_tx = frontier_tx.clone();
 
     // Feed each session its frontiers, then a Boundary marker. The marker
     // bounds a session's consumption so a stopping leader's speculative
@@ -603,21 +660,21 @@ fn start_fixtures(
         for frontiers in session_frontiers {
             for frontier in frontiers {
                 if frontier_tx
-                    .send(fixture::FixtureItem::Frontier(frontier))
+                    .send(segments::FixtureItem::Frontier(frontier))
                     .is_err()
                 {
                     return; // The consumer went away.
                 }
             }
             if frontier_tx
-                .send(fixture::FixtureItem::Boundary { reached: None })
+                .send(segments::FixtureItem::Boundary { reached: None })
                 .is_err()
             {
                 return;
             }
         }
-        // Dropping `frontier_tx` here signals end-of-fixtures to the replay
-        // Session (relevant only once `run.frontier_tx` is also dropped).
+        // Dropping this `frontier_tx` clone signals end-of-fixtures to the
+        // replay Session (relevant only once the caller's copy is also dropped).
     });
 
     Ok((session_targets, session_dirs, plan))

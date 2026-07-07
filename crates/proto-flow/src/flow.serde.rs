@@ -1,175 +1,3 @@
-impl serde::Serialize for AdvanceTimeRequest {
-    #[allow(deprecated)]
-    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        use serde::ser::SerializeStruct;
-        let mut len = 0;
-        if self.advance_seconds != 0 {
-            len += 1;
-        }
-        let mut struct_ser = serializer.serialize_struct("flow.AdvanceTimeRequest", len)?;
-        if self.advance_seconds != 0 {
-            #[allow(clippy::needless_borrow)]
-            #[allow(clippy::needless_borrows_for_generic_args)]
-            struct_ser.serialize_field("advanceSeconds", ToString::to_string(&self.advance_seconds).as_str())?;
-        }
-        struct_ser.end()
-    }
-}
-impl<'de> serde::Deserialize<'de> for AdvanceTimeRequest {
-    #[allow(deprecated)]
-    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        const FIELDS: &[&str] = &[
-            "advance_seconds",
-            "advanceSeconds",
-        ];
-
-        #[allow(clippy::enum_variant_names)]
-        enum GeneratedField {
-            AdvanceSeconds,
-            __SkipField__,
-        }
-        impl<'de> serde::Deserialize<'de> for GeneratedField {
-            fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
-            where
-                D: serde::Deserializer<'de>,
-            {
-                struct GeneratedVisitor;
-
-                impl<'de> serde::de::Visitor<'de> for GeneratedVisitor {
-                    type Value = GeneratedField;
-
-                    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                        write!(formatter, "expected one of: {:?}", &FIELDS)
-                    }
-
-                    #[allow(unused_variables)]
-                    fn visit_str<E>(self, value: &str) -> std::result::Result<GeneratedField, E>
-                    where
-                        E: serde::de::Error,
-                    {
-                        match value {
-                            "advanceSeconds" | "advance_seconds" => Ok(GeneratedField::AdvanceSeconds),
-                            _ => Ok(GeneratedField::__SkipField__),
-                        }
-                    }
-                }
-                deserializer.deserialize_identifier(GeneratedVisitor)
-            }
-        }
-        struct GeneratedVisitor;
-        impl<'de> serde::de::Visitor<'de> for GeneratedVisitor {
-            type Value = AdvanceTimeRequest;
-
-            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                formatter.write_str("struct flow.AdvanceTimeRequest")
-            }
-
-            fn visit_map<V>(self, mut map_: V) -> std::result::Result<AdvanceTimeRequest, V::Error>
-                where
-                    V: serde::de::MapAccess<'de>,
-            {
-                let mut advance_seconds__ = None;
-                while let Some(k) = map_.next_key()? {
-                    match k {
-                        GeneratedField::AdvanceSeconds => {
-                            if advance_seconds__.is_some() {
-                                return Err(serde::de::Error::duplicate_field("advanceSeconds"));
-                            }
-                            advance_seconds__ = 
-                                Some(map_.next_value::<::pbjson::private::NumberDeserialize<_>>()?.0)
-                            ;
-                        }
-                        GeneratedField::__SkipField__ => {
-                            let _ = map_.next_value::<serde::de::IgnoredAny>()?;
-                        }
-                    }
-                }
-                Ok(AdvanceTimeRequest {
-                    advance_seconds: advance_seconds__.unwrap_or_default(),
-                })
-            }
-        }
-        deserializer.deserialize_struct("flow.AdvanceTimeRequest", FIELDS, GeneratedVisitor)
-    }
-}
-impl serde::Serialize for AdvanceTimeResponse {
-    #[allow(deprecated)]
-    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        use serde::ser::SerializeStruct;
-        let len = 0;
-        let struct_ser = serializer.serialize_struct("flow.AdvanceTimeResponse", len)?;
-        struct_ser.end()
-    }
-}
-impl<'de> serde::Deserialize<'de> for AdvanceTimeResponse {
-    #[allow(deprecated)]
-    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        const FIELDS: &[&str] = &[
-        ];
-
-        #[allow(clippy::enum_variant_names)]
-        enum GeneratedField {
-            __SkipField__,
-        }
-        impl<'de> serde::Deserialize<'de> for GeneratedField {
-            fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
-            where
-                D: serde::Deserializer<'de>,
-            {
-                struct GeneratedVisitor;
-
-                impl<'de> serde::de::Visitor<'de> for GeneratedVisitor {
-                    type Value = GeneratedField;
-
-                    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                        write!(formatter, "expected one of: {:?}", &FIELDS)
-                    }
-
-                    #[allow(unused_variables)]
-                    fn visit_str<E>(self, value: &str) -> std::result::Result<GeneratedField, E>
-                    where
-                        E: serde::de::Error,
-                    {
-                            Ok(GeneratedField::__SkipField__)
-                    }
-                }
-                deserializer.deserialize_identifier(GeneratedVisitor)
-            }
-        }
-        struct GeneratedVisitor;
-        impl<'de> serde::de::Visitor<'de> for GeneratedVisitor {
-            type Value = AdvanceTimeResponse;
-
-            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                formatter.write_str("struct flow.AdvanceTimeResponse")
-            }
-
-            fn visit_map<V>(self, mut map_: V) -> std::result::Result<AdvanceTimeResponse, V::Error>
-                where
-                    V: serde::de::MapAccess<'de>,
-            {
-                while map_.next_key::<GeneratedField>()?.is_some() {
-                    let _ = map_.next_value::<serde::de::IgnoredAny>()?;
-                }
-                Ok(AdvanceTimeResponse {
-                })
-            }
-        }
-        deserializer.deserialize_struct("flow.AdvanceTimeResponse", FIELDS, GeneratedVisitor)
-    }
-}
 impl serde::Serialize for BuildApi {
     #[allow(deprecated)]
     fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
@@ -625,7 +453,7 @@ impl<'de> serde::Deserialize<'de> for CaptureSpec {
                             if config_json__.is_some() {
                                 return Err(serde::de::Error::duplicate_field("config"));
                             }
-                            config_json__ = 
+                            config_json__ =
                                 Some(map_.next_value::<crate::RawJSONDeserialize>()?.0)
                             ;
                         }
@@ -639,7 +467,7 @@ impl<'de> serde::Deserialize<'de> for CaptureSpec {
                             if interval_seconds__.is_some() {
                                 return Err(serde::de::Error::duplicate_field("intervalSeconds"));
                             }
-                            interval_seconds__ = 
+                            interval_seconds__ =
                                 Some(map_.next_value::<::pbjson::private::NumberDeserialize<_>>()?.0)
                             ;
                         }
@@ -671,7 +499,7 @@ impl<'de> serde::Deserialize<'de> for CaptureSpec {
                             if redact_salt__.is_some() {
                                 return Err(serde::de::Error::duplicate_field("redactSalt"));
                             }
-                            redact_salt__ = 
+                            redact_salt__ =
                                 Some(map_.next_value::<::pbjson::private::BytesDeserialize<_>>()?.0)
                             ;
                         }
@@ -822,7 +650,7 @@ impl<'de> serde::Deserialize<'de> for capture_spec::Binding {
                             if resource_config_json__.is_some() {
                                 return Err(serde::de::Error::duplicate_field("resourceConfig"));
                             }
-                            resource_config_json__ = 
+                            resource_config_json__ =
                                 Some(map_.next_value::<crate::RawJSONDeserialize>()?.0)
                             ;
                         }
@@ -842,7 +670,7 @@ impl<'de> serde::Deserialize<'de> for capture_spec::Binding {
                             if backfill__.is_some() {
                                 return Err(serde::de::Error::duplicate_field("backfill"));
                             }
-                            backfill__ = 
+                            backfill__ =
                                 Some(map_.next_value::<::pbjson::private::NumberDeserialize<_>>()?.0)
                             ;
                         }
@@ -1131,7 +959,7 @@ impl<'de> serde::Deserialize<'de> for CollectionSpec {
                             if write_schema_json__.is_some() {
                                 return Err(serde::de::Error::duplicate_field("writeSchema"));
                             }
-                            write_schema_json__ = 
+                            write_schema_json__ =
                                 Some(map_.next_value::<crate::RawJSONDeserialize>()?.0)
                             ;
                         }
@@ -1139,7 +967,7 @@ impl<'de> serde::Deserialize<'de> for CollectionSpec {
                             if read_schema_json__.is_some() {
                                 return Err(serde::de::Error::duplicate_field("readSchema"));
                             }
-                            read_schema_json__ = 
+                            read_schema_json__ =
                                 Some(map_.next_value::<crate::RawJSONDeserialize>()?.0)
                             ;
                         }
@@ -1171,7 +999,7 @@ impl<'de> serde::Deserialize<'de> for CollectionSpec {
                             if ack_template_json__.is_some() {
                                 return Err(serde::de::Error::duplicate_field("ackTemplate"));
                             }
-                            ack_template_json__ = 
+                            ack_template_json__ =
                                 Some(map_.next_value::<crate::RawJSONDeserialize>()?.0)
                             ;
                         }
@@ -1393,7 +1221,7 @@ impl<'de> serde::Deserialize<'de> for collection_spec::Derivation {
                             if config_json__.is_some() {
                                 return Err(serde::de::Error::duplicate_field("config"));
                             }
-                            config_json__ = 
+                            config_json__ =
                                 Some(map_.next_value::<crate::RawJSONDeserialize>()?.0)
                             ;
                         }
@@ -1437,7 +1265,7 @@ impl<'de> serde::Deserialize<'de> for collection_spec::Derivation {
                             if redact_salt__.is_some() {
                                 return Err(serde::de::Error::duplicate_field("redactSalt"));
                             }
-                            redact_salt__ = 
+                            redact_salt__ =
                                 Some(map_.next_value::<::pbjson::private::BytesDeserialize<_>>()?.0)
                             ;
                         }
@@ -1864,7 +1692,7 @@ impl<'de> serde::Deserialize<'de> for collection_spec::derivation::Transform {
                             if priority__.is_some() {
                                 return Err(serde::de::Error::duplicate_field("priority"));
                             }
-                            priority__ = 
+                            priority__ =
                                 Some(map_.next_value::<::pbjson::private::NumberDeserialize<_>>()?.0)
                             ;
                         }
@@ -1872,7 +1700,7 @@ impl<'de> serde::Deserialize<'de> for collection_spec::derivation::Transform {
                             if read_delay_seconds__.is_some() {
                                 return Err(serde::de::Error::duplicate_field("readDelaySeconds"));
                             }
-                            read_delay_seconds__ = 
+                            read_delay_seconds__ =
                                 Some(map_.next_value::<::pbjson::private::NumberDeserialize<_>>()?.0)
                             ;
                         }
@@ -1886,7 +1714,7 @@ impl<'de> serde::Deserialize<'de> for collection_spec::derivation::Transform {
                             if shuffle_lambda_config_json__.is_some() {
                                 return Err(serde::de::Error::duplicate_field("shuffleLambdaConfig"));
                             }
-                            shuffle_lambda_config_json__ = 
+                            shuffle_lambda_config_json__ =
                                 Some(map_.next_value::<crate::RawJSONDeserialize>()?.0)
                             ;
                         }
@@ -1894,7 +1722,7 @@ impl<'de> serde::Deserialize<'de> for collection_spec::derivation::Transform {
                             if lambda_config_json__.is_some() {
                                 return Err(serde::de::Error::duplicate_field("lambdaConfig"));
                             }
-                            lambda_config_json__ = 
+                            lambda_config_json__ =
                                 Some(map_.next_value::<crate::RawJSONDeserialize>()?.0)
                             ;
                         }
@@ -1926,7 +1754,7 @@ impl<'de> serde::Deserialize<'de> for collection_spec::derivation::Transform {
                             if backfill__.is_some() {
                                 return Err(serde::de::Error::duplicate_field("backfill"));
                             }
-                            backfill__ = 
+                            backfill__ =
                                 Some(map_.next_value::<::pbjson::private::NumberDeserialize<_>>()?.0)
                             ;
                         }
@@ -2056,7 +1884,7 @@ impl<'de> serde::Deserialize<'de> for ConnectorState {
                             if updated_json__.is_some() {
                                 return Err(serde::de::Error::duplicate_field("updated"));
                             }
-                            updated_json__ = 
+                            updated_json__ =
                                 Some(map_.next_value::<crate::RawJSONDeserialize>()?.0)
                             ;
                         }
@@ -2430,7 +2258,7 @@ impl<'de> serde::Deserialize<'de> for extract_api::Config {
                             if schema_json__.is_some() {
                                 return Err(serde::de::Error::duplicate_field("schemaJson"));
                             }
-                            schema_json__ = 
+                            schema_json__ =
                                 Some(map_.next_value::<crate::RawJSONDeserialize>()?.0)
                             ;
                         }
@@ -2847,7 +2675,7 @@ impl<'de> serde::Deserialize<'de> for Inference {
                             if default_json__.is_some() {
                                 return Err(serde::de::Error::duplicate_field("default"));
                             }
-                            default_json__ = 
+                            default_json__ =
                                 Some(map_.next_value::<crate::RawJSONDeserialize>()?.0)
                             ;
                         }
@@ -2879,7 +2707,7 @@ impl<'de> serde::Deserialize<'de> for Inference {
                             if enum_json_vec__.is_some() {
                                 return Err(serde::de::Error::duplicate_field("enum"));
                             }
-                            enum_json_vec__ = 
+                            enum_json_vec__ =
                                 Some(map_.next_value::<Vec<crate::RawJSONDeserialize>>()?
                                     .into_iter().map(|x| x.0).collect())
                             ;
@@ -3041,7 +2869,7 @@ impl<'de> serde::Deserialize<'de> for inference::Array {
                             if min_items__.is_some() {
                                 return Err(serde::de::Error::duplicate_field("minItems"));
                             }
-                            min_items__ = 
+                            min_items__ =
                                 Some(map_.next_value::<::pbjson::private::NumberDeserialize<_>>()?.0)
                             ;
                         }
@@ -3055,7 +2883,7 @@ impl<'de> serde::Deserialize<'de> for inference::Array {
                             if max_items__.is_some() {
                                 return Err(serde::de::Error::duplicate_field("maxItems"));
                             }
-                            max_items__ = 
+                            max_items__ =
                                 Some(map_.next_value::<::pbjson::private::NumberDeserialize<_>>()?.0)
                             ;
                         }
@@ -3279,7 +3107,7 @@ impl<'de> serde::Deserialize<'de> for inference::Numeric {
                             if minimum__.is_some() {
                                 return Err(serde::de::Error::duplicate_field("minimum"));
                             }
-                            minimum__ = 
+                            minimum__ =
                                 Some(map_.next_value::<::pbjson::private::NumberDeserialize<_>>()?.0)
                             ;
                         }
@@ -3293,7 +3121,7 @@ impl<'de> serde::Deserialize<'de> for inference::Numeric {
                             if maximum__.is_some() {
                                 return Err(serde::de::Error::duplicate_field("maximum"));
                             }
-                            maximum__ = 
+                            maximum__ =
                                 Some(map_.next_value::<::pbjson::private::NumberDeserialize<_>>()?.0)
                             ;
                         }
@@ -3641,7 +3469,7 @@ impl<'de> serde::Deserialize<'de> for inference::String {
                             if max_length__.is_some() {
                                 return Err(serde::de::Error::duplicate_field("maxLength"));
                             }
-                            max_length__ = 
+                            max_length__ =
                                 Some(map_.next_value::<::pbjson::private::NumberDeserialize<_>>()?.0)
                             ;
                         }
@@ -3673,259 +3501,6 @@ impl<'de> serde::Deserialize<'de> for inference::String {
             }
         }
         deserializer.deserialize_struct("flow.Inference.String", FIELDS, GeneratedVisitor)
-    }
-}
-impl serde::Serialize for IngestRequest {
-    #[allow(deprecated)]
-    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        use serde::ser::SerializeStruct;
-        let mut len = 0;
-        if !self.collection.is_empty() {
-            len += 1;
-        }
-        if !self.build_id.is_empty() {
-            len += 1;
-        }
-        if !self.docs_json_vec.is_empty() {
-            len += 1;
-        }
-        let mut struct_ser = serializer.serialize_struct("flow.IngestRequest", len)?;
-        if !self.collection.is_empty() {
-            struct_ser.serialize_field("collection", &self.collection)?;
-        }
-        if !self.build_id.is_empty() {
-            struct_ser.serialize_field("buildId", &self.build_id)?;
-        }
-        if !self.docs_json_vec.is_empty() {
-            struct_ser.serialize_field("docs", &crate::as_raw_json_vec(&self.docs_json_vec)?)?;
-        }
-        struct_ser.end()
-    }
-}
-impl<'de> serde::Deserialize<'de> for IngestRequest {
-    #[allow(deprecated)]
-    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        const FIELDS: &[&str] = &[
-            "collection",
-            "build_id",
-            "buildId",
-            "docs_json_vec",
-            "docs",
-        ];
-
-        #[allow(clippy::enum_variant_names)]
-        enum GeneratedField {
-            Collection,
-            BuildId,
-            DocsJsonVec,
-            __SkipField__,
-        }
-        impl<'de> serde::Deserialize<'de> for GeneratedField {
-            fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
-            where
-                D: serde::Deserializer<'de>,
-            {
-                struct GeneratedVisitor;
-
-                impl<'de> serde::de::Visitor<'de> for GeneratedVisitor {
-                    type Value = GeneratedField;
-
-                    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                        write!(formatter, "expected one of: {:?}", &FIELDS)
-                    }
-
-                    #[allow(unused_variables)]
-                    fn visit_str<E>(self, value: &str) -> std::result::Result<GeneratedField, E>
-                    where
-                        E: serde::de::Error,
-                    {
-                        match value {
-                            "collection" => Ok(GeneratedField::Collection),
-                            "buildId" | "build_id" => Ok(GeneratedField::BuildId),
-                            "docs" | "docs_json_vec" => Ok(GeneratedField::DocsJsonVec),
-                            _ => Ok(GeneratedField::__SkipField__),
-                        }
-                    }
-                }
-                deserializer.deserialize_identifier(GeneratedVisitor)
-            }
-        }
-        struct GeneratedVisitor;
-        impl<'de> serde::de::Visitor<'de> for GeneratedVisitor {
-            type Value = IngestRequest;
-
-            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                formatter.write_str("struct flow.IngestRequest")
-            }
-
-            fn visit_map<V>(self, mut map_: V) -> std::result::Result<IngestRequest, V::Error>
-                where
-                    V: serde::de::MapAccess<'de>,
-            {
-                let mut collection__ = None;
-                let mut build_id__ = None;
-                let mut docs_json_vec__ = None;
-                while let Some(k) = map_.next_key()? {
-                    match k {
-                        GeneratedField::Collection => {
-                            if collection__.is_some() {
-                                return Err(serde::de::Error::duplicate_field("collection"));
-                            }
-                            collection__ = Some(map_.next_value()?);
-                        }
-                        GeneratedField::BuildId => {
-                            if build_id__.is_some() {
-                                return Err(serde::de::Error::duplicate_field("buildId"));
-                            }
-                            build_id__ = Some(map_.next_value()?);
-                        }
-                        GeneratedField::DocsJsonVec => {
-                            if docs_json_vec__.is_some() {
-                                return Err(serde::de::Error::duplicate_field("docs"));
-                            }
-                            docs_json_vec__ = 
-                                Some(map_.next_value::<Vec<crate::RawJSONDeserialize>>()?
-                                    .into_iter().map(|x| x.0).collect())
-                            ;
-                        }
-                        GeneratedField::__SkipField__ => {
-                            let _ = map_.next_value::<serde::de::IgnoredAny>()?;
-                        }
-                    }
-                }
-                Ok(IngestRequest {
-                    collection: collection__.unwrap_or_default(),
-                    build_id: build_id__.unwrap_or_default(),
-                    docs_json_vec: docs_json_vec__.unwrap_or_default(),
-                })
-            }
-        }
-        deserializer.deserialize_struct("flow.IngestRequest", FIELDS, GeneratedVisitor)
-    }
-}
-impl serde::Serialize for IngestResponse {
-    #[allow(deprecated)]
-    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        use serde::ser::SerializeStruct;
-        let mut len = 0;
-        if !self.journal_write_heads.is_empty() {
-            len += 1;
-        }
-        if self.journal_etcd.is_some() {
-            len += 1;
-        }
-        let mut struct_ser = serializer.serialize_struct("flow.IngestResponse", len)?;
-        if !self.journal_write_heads.is_empty() {
-            let v: std::collections::HashMap<_, _> = self.journal_write_heads.iter()
-                .map(|(k, v)| (k, v.to_string())).collect();
-            struct_ser.serialize_field("journalWriteHeads", &v)?;
-        }
-        if let Some(v) = self.journal_etcd.as_ref() {
-            struct_ser.serialize_field("journalEtcd", v)?;
-        }
-        struct_ser.end()
-    }
-}
-impl<'de> serde::Deserialize<'de> for IngestResponse {
-    #[allow(deprecated)]
-    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        const FIELDS: &[&str] = &[
-            "journal_write_heads",
-            "journalWriteHeads",
-            "journal_etcd",
-            "journalEtcd",
-        ];
-
-        #[allow(clippy::enum_variant_names)]
-        enum GeneratedField {
-            JournalWriteHeads,
-            JournalEtcd,
-            __SkipField__,
-        }
-        impl<'de> serde::Deserialize<'de> for GeneratedField {
-            fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
-            where
-                D: serde::Deserializer<'de>,
-            {
-                struct GeneratedVisitor;
-
-                impl<'de> serde::de::Visitor<'de> for GeneratedVisitor {
-                    type Value = GeneratedField;
-
-                    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                        write!(formatter, "expected one of: {:?}", &FIELDS)
-                    }
-
-                    #[allow(unused_variables)]
-                    fn visit_str<E>(self, value: &str) -> std::result::Result<GeneratedField, E>
-                    where
-                        E: serde::de::Error,
-                    {
-                        match value {
-                            "journalWriteHeads" | "journal_write_heads" => Ok(GeneratedField::JournalWriteHeads),
-                            "journalEtcd" | "journal_etcd" => Ok(GeneratedField::JournalEtcd),
-                            _ => Ok(GeneratedField::__SkipField__),
-                        }
-                    }
-                }
-                deserializer.deserialize_identifier(GeneratedVisitor)
-            }
-        }
-        struct GeneratedVisitor;
-        impl<'de> serde::de::Visitor<'de> for GeneratedVisitor {
-            type Value = IngestResponse;
-
-            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                formatter.write_str("struct flow.IngestResponse")
-            }
-
-            fn visit_map<V>(self, mut map_: V) -> std::result::Result<IngestResponse, V::Error>
-                where
-                    V: serde::de::MapAccess<'de>,
-            {
-                let mut journal_write_heads__ = None;
-                let mut journal_etcd__ = None;
-                while let Some(k) = map_.next_key()? {
-                    match k {
-                        GeneratedField::JournalWriteHeads => {
-                            if journal_write_heads__.is_some() {
-                                return Err(serde::de::Error::duplicate_field("journalWriteHeads"));
-                            }
-                            journal_write_heads__ = Some(
-                                map_.next_value::<std::collections::BTreeMap<_, ::pbjson::private::NumberDeserialize<i64>>>()?
-                                    .into_iter().map(|(k,v)| (k, v.0)).collect()
-                            );
-                        }
-                        GeneratedField::JournalEtcd => {
-                            if journal_etcd__.is_some() {
-                                return Err(serde::de::Error::duplicate_field("journalEtcd"));
-                            }
-                            journal_etcd__ = map_.next_value()?;
-                        }
-                        GeneratedField::__SkipField__ => {
-                            let _ = map_.next_value::<serde::de::IgnoredAny>()?;
-                        }
-                    }
-                }
-                Ok(IngestResponse {
-                    journal_write_heads: journal_write_heads__.unwrap_or_default(),
-                    journal_etcd: journal_etcd__,
-                })
-            }
-        }
-        deserializer.deserialize_struct("flow.IngestResponse", FIELDS, GeneratedVisitor)
     }
 }
 impl serde::Serialize for MaterializationSpec {
@@ -4113,7 +3688,7 @@ impl<'de> serde::Deserialize<'de> for MaterializationSpec {
                             if config_json__.is_some() {
                                 return Err(serde::de::Error::duplicate_field("config"));
                             }
-                            config_json__ = 
+                            config_json__ =
                                 Some(map_.next_value::<crate::RawJSONDeserialize>()?.0)
                             ;
                         }
@@ -4151,7 +3726,7 @@ impl<'de> serde::Deserialize<'de> for MaterializationSpec {
                             if triggers_json__.is_some() {
                                 return Err(serde::de::Error::duplicate_field("triggers"));
                             }
-                            triggers_json__ = 
+                            triggers_json__ =
                                 Some(map_.next_value::<crate::RawJSONDeserialize>()?.0)
                             ;
                         }
@@ -4399,7 +3974,7 @@ impl<'de> serde::Deserialize<'de> for materialization_spec::Binding {
                             if resource_config_json__.is_some() {
                                 return Err(serde::de::Error::duplicate_field("resourceConfig"));
                             }
-                            resource_config_json__ = 
+                            resource_config_json__ =
                                 Some(map_.next_value::<crate::RawJSONDeserialize>()?.0)
                             ;
                         }
@@ -4425,7 +4000,7 @@ impl<'de> serde::Deserialize<'de> for materialization_spec::Binding {
                             if priority__.is_some() {
                                 return Err(serde::de::Error::duplicate_field("priority"));
                             }
-                            priority__ = 
+                            priority__ =
                                 Some(map_.next_value::<::pbjson::private::NumberDeserialize<_>>()?.0)
                             ;
                         }
@@ -4469,7 +4044,7 @@ impl<'de> serde::Deserialize<'de> for materialization_spec::Binding {
                             if backfill__.is_some() {
                                 return Err(serde::de::Error::duplicate_field("backfill"));
                             }
-                            backfill__ = 
+                            backfill__ =
                                 Some(map_.next_value::<::pbjson::private::NumberDeserialize<_>>()?.0)
                             ;
                         }
@@ -4802,7 +4377,7 @@ impl<'de> serde::Deserialize<'de> for NetworkPort {
                             if number__.is_some() {
                                 return Err(serde::de::Error::duplicate_field("number"));
                             }
-                            number__ = 
+                            number__ =
                                 Some(map_.next_value::<::pbjson::private::NumberDeserialize<_>>()?.0)
                             ;
                         }
@@ -5434,7 +5009,7 @@ impl<'de> serde::Deserialize<'de> for RangeSpec {
                             if key_begin__.is_some() {
                                 return Err(serde::de::Error::duplicate_field("keyBegin"));
                             }
-                            key_begin__ = 
+                            key_begin__ =
                                 Some(map_.next_value::<::pbjson::private::NumberDeserialize<_>>()?.0)
                             ;
                         }
@@ -5442,7 +5017,7 @@ impl<'de> serde::Deserialize<'de> for RangeSpec {
                             if key_end__.is_some() {
                                 return Err(serde::de::Error::duplicate_field("keyEnd"));
                             }
-                            key_end__ = 
+                            key_end__ =
                                 Some(map_.next_value::<::pbjson::private::NumberDeserialize<_>>()?.0)
                             ;
                         }
@@ -5450,7 +5025,7 @@ impl<'de> serde::Deserialize<'de> for RangeSpec {
                             if r_clock_begin__.is_some() {
                                 return Err(serde::de::Error::duplicate_field("rClockBegin"));
                             }
-                            r_clock_begin__ = 
+                            r_clock_begin__ =
                                 Some(map_.next_value::<::pbjson::private::NumberDeserialize<_>>()?.0)
                             ;
                         }
@@ -5458,7 +5033,7 @@ impl<'de> serde::Deserialize<'de> for RangeSpec {
                             if r_clock_end__.is_some() {
                                 return Err(serde::de::Error::duplicate_field("rClockEnd"));
                             }
-                            r_clock_end__ = 
+                            r_clock_end__ =
                                 Some(map_.next_value::<::pbjson::private::NumberDeserialize<_>>()?.0)
                             ;
                         }
@@ -5476,150 +5051,6 @@ impl<'de> serde::Deserialize<'de> for RangeSpec {
             }
         }
         deserializer.deserialize_struct("flow.RangeSpec", FIELDS, GeneratedVisitor)
-    }
-}
-impl serde::Serialize for ResetStateRequest {
-    #[allow(deprecated)]
-    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        use serde::ser::SerializeStruct;
-        let len = 0;
-        let struct_ser = serializer.serialize_struct("flow.ResetStateRequest", len)?;
-        struct_ser.end()
-    }
-}
-impl<'de> serde::Deserialize<'de> for ResetStateRequest {
-    #[allow(deprecated)]
-    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        const FIELDS: &[&str] = &[
-        ];
-
-        #[allow(clippy::enum_variant_names)]
-        enum GeneratedField {
-            __SkipField__,
-        }
-        impl<'de> serde::Deserialize<'de> for GeneratedField {
-            fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
-            where
-                D: serde::Deserializer<'de>,
-            {
-                struct GeneratedVisitor;
-
-                impl<'de> serde::de::Visitor<'de> for GeneratedVisitor {
-                    type Value = GeneratedField;
-
-                    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                        write!(formatter, "expected one of: {:?}", &FIELDS)
-                    }
-
-                    #[allow(unused_variables)]
-                    fn visit_str<E>(self, value: &str) -> std::result::Result<GeneratedField, E>
-                    where
-                        E: serde::de::Error,
-                    {
-                            Ok(GeneratedField::__SkipField__)
-                    }
-                }
-                deserializer.deserialize_identifier(GeneratedVisitor)
-            }
-        }
-        struct GeneratedVisitor;
-        impl<'de> serde::de::Visitor<'de> for GeneratedVisitor {
-            type Value = ResetStateRequest;
-
-            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                formatter.write_str("struct flow.ResetStateRequest")
-            }
-
-            fn visit_map<V>(self, mut map_: V) -> std::result::Result<ResetStateRequest, V::Error>
-                where
-                    V: serde::de::MapAccess<'de>,
-            {
-                while map_.next_key::<GeneratedField>()?.is_some() {
-                    let _ = map_.next_value::<serde::de::IgnoredAny>()?;
-                }
-                Ok(ResetStateRequest {
-                })
-            }
-        }
-        deserializer.deserialize_struct("flow.ResetStateRequest", FIELDS, GeneratedVisitor)
-    }
-}
-impl serde::Serialize for ResetStateResponse {
-    #[allow(deprecated)]
-    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        use serde::ser::SerializeStruct;
-        let len = 0;
-        let struct_ser = serializer.serialize_struct("flow.ResetStateResponse", len)?;
-        struct_ser.end()
-    }
-}
-impl<'de> serde::Deserialize<'de> for ResetStateResponse {
-    #[allow(deprecated)]
-    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        const FIELDS: &[&str] = &[
-        ];
-
-        #[allow(clippy::enum_variant_names)]
-        enum GeneratedField {
-            __SkipField__,
-        }
-        impl<'de> serde::Deserialize<'de> for GeneratedField {
-            fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
-            where
-                D: serde::Deserializer<'de>,
-            {
-                struct GeneratedVisitor;
-
-                impl<'de> serde::de::Visitor<'de> for GeneratedVisitor {
-                    type Value = GeneratedField;
-
-                    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                        write!(formatter, "expected one of: {:?}", &FIELDS)
-                    }
-
-                    #[allow(unused_variables)]
-                    fn visit_str<E>(self, value: &str) -> std::result::Result<GeneratedField, E>
-                    where
-                        E: serde::de::Error,
-                    {
-                            Ok(GeneratedField::__SkipField__)
-                    }
-                }
-                deserializer.deserialize_identifier(GeneratedVisitor)
-            }
-        }
-        struct GeneratedVisitor;
-        impl<'de> serde::de::Visitor<'de> for GeneratedVisitor {
-            type Value = ResetStateResponse;
-
-            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                formatter.write_str("struct flow.ResetStateResponse")
-            }
-
-            fn visit_map<V>(self, mut map_: V) -> std::result::Result<ResetStateResponse, V::Error>
-                where
-                    V: serde::de::MapAccess<'de>,
-            {
-                while map_.next_key::<GeneratedField>()?.is_some() {
-                    let _ = map_.next_value::<serde::de::IgnoredAny>()?;
-                }
-                Ok(ResetStateResponse {
-                })
-            }
-        }
-        deserializer.deserialize_struct("flow.ResetStateResponse", FIELDS, GeneratedVisitor)
     }
 }
 impl serde::Serialize for SerPolicy {
@@ -5725,7 +5156,7 @@ impl<'de> serde::Deserialize<'de> for SerPolicy {
                             if str_truncate_after__.is_some() {
                                 return Err(serde::de::Error::duplicate_field("strTruncateAfter"));
                             }
-                            str_truncate_after__ = 
+                            str_truncate_after__ =
                                 Some(map_.next_value::<::pbjson::private::NumberDeserialize<_>>()?.0)
                             ;
                         }
@@ -5733,7 +5164,7 @@ impl<'de> serde::Deserialize<'de> for SerPolicy {
                             if nested_obj_truncate_after__.is_some() {
                                 return Err(serde::de::Error::duplicate_field("nestedObjTruncateAfter"));
                             }
-                            nested_obj_truncate_after__ = 
+                            nested_obj_truncate_after__ =
                                 Some(map_.next_value::<::pbjson::private::NumberDeserialize<_>>()?.0)
                             ;
                         }
@@ -5741,7 +5172,7 @@ impl<'de> serde::Deserialize<'de> for SerPolicy {
                             if array_truncate_after__.is_some() {
                                 return Err(serde::de::Error::duplicate_field("arrayTruncateAfter"));
                             }
-                            array_truncate_after__ = 
+                            array_truncate_after__ =
                                 Some(map_.next_value::<::pbjson::private::NumberDeserialize<_>>()?.0)
                             ;
                         }
@@ -5850,7 +5281,7 @@ impl<'de> serde::Deserialize<'de> for Slice {
                             if begin__.is_some() {
                                 return Err(serde::de::Error::duplicate_field("begin"));
                             }
-                            begin__ = 
+                            begin__ =
                                 Some(map_.next_value::<::pbjson::private::NumberDeserialize<_>>()?.0)
                             ;
                         }
@@ -5858,7 +5289,7 @@ impl<'de> serde::Deserialize<'de> for Slice {
                             if end__.is_some() {
                                 return Err(serde::de::Error::duplicate_field("end"));
                             }
-                            end__ = 
+                            end__ =
                                 Some(map_.next_value::<::pbjson::private::NumberDeserialize<_>>()?.0)
                             ;
                         }
@@ -5974,7 +5405,7 @@ impl<'de> serde::Deserialize<'de> for TaskNetworkProxyRequest {
                             if data__.is_some() {
                                 return Err(serde::de::Error::duplicate_field("data"));
                             }
-                            data__ = 
+                            data__ =
                                 Some(map_.next_value::<::pbjson::private::BytesDeserialize<_>>()?.0)
                             ;
                         }
@@ -6117,7 +5548,7 @@ impl<'de> serde::Deserialize<'de> for task_network_proxy_request::Open {
                             if target_port__.is_some() {
                                 return Err(serde::de::Error::duplicate_field("targetPort"));
                             }
-                            target_port__ = 
+                            target_port__ =
                                 Some(map_.next_value::<::pbjson::private::NumberDeserialize<_>>()?.0)
                             ;
                         }
@@ -6242,7 +5673,7 @@ impl<'de> serde::Deserialize<'de> for TaskNetworkProxyResponse {
                             if data__.is_some() {
                                 return Err(serde::de::Error::duplicate_field("data"));
                             }
-                            data__ = 
+                            data__ =
                                 Some(map_.next_value::<::pbjson::private::BytesDeserialize<_>>()?.0)
                             ;
                         }
@@ -6724,7 +6155,7 @@ impl<'de> serde::Deserialize<'de> for test_spec::Step {
                             if step_index__.is_some() {
                                 return Err(serde::de::Error::duplicate_field("stepIndex"));
                             }
-                            step_index__ = 
+                            step_index__ =
                                 Some(map_.next_value::<::pbjson::private::NumberDeserialize<_>>()?.0)
                             ;
                         }
@@ -6750,7 +6181,7 @@ impl<'de> serde::Deserialize<'de> for test_spec::Step {
                             if docs_json_vec__.is_some() {
                                 return Err(serde::de::Error::duplicate_field("docs"));
                             }
-                            docs_json_vec__ = 
+                            docs_json_vec__ =
                                 Some(map_.next_value::<Vec<crate::RawJSONDeserialize>>()?
                                     .into_iter().map(|x| x.0).collect())
                             ;
@@ -6945,7 +6376,7 @@ impl<'de> serde::Deserialize<'de> for UuidParts {
                             if node__.is_some() {
                                 return Err(serde::de::Error::duplicate_field("node"));
                             }
-                            node__ = 
+                            node__ =
                                 Some(map_.next_value::<::pbjson::private::NumberDeserialize<_>>()?.0)
                             ;
                         }
@@ -6953,7 +6384,7 @@ impl<'de> serde::Deserialize<'de> for UuidParts {
                             if clock__.is_some() {
                                 return Err(serde::de::Error::duplicate_field("clock"));
                             }
-                            clock__ = 
+                            clock__ =
                                 Some(map_.next_value::<::pbjson::private::NumberDeserialize<_>>()?.0)
                             ;
                         }
