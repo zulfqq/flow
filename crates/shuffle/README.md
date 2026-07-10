@@ -123,13 +123,20 @@ For example, a binding read with an explicit delay cannot gate a binding read in
 The legacy shuffle implementation has several limitations that motivated
 this crate:
 
-**Replay reads → conservative reads**: The legacy system reads optimistically
-from the latest journal offset. When an uncommitted transaction later commits,
-the system performs bounded "replay reads" to re-read that data, which is high
-latency and performs poorly. This implementation instead reads conservatively
-from the earliest `begin_offset` of any uncommitted producer in the checkpoint,
-eliminating replay reads entirely. The tradeoff is potentially re-reading already-
-committed data on startup if producers have long-running uncommitted transactions.
+**Replay reads → checkpoint skip-ahead + targeted backfill**: The legacy system
+reads optimistically from the latest journal offset. When an uncommitted
+transaction later commits, the system performs bounded "replay reads" to re-read
+that data, which is high latency and performs poorly. This implementation reads
+from a checkpoint-derived position: on restart each `(binding, journal)` read
+begins near the furthest position its checkpoint justifies (`M`), allowing a
+configured, bounded window `B` of conservative near-frontier re-read. Uncommitted
+producer spans beginning before that window are remembered as *gapped* and
+suppressed, so a dead producer's stale open span costs no repeated whole-journal
+catch-up. If a gapped producer later commits, the read parks at its ACK,
+backfills only that producer's pending transaction from cold storage if needed,
+and publishes it atomically. See the "Gapped-producer recovery" section below
+and `plans/shuffle-gapped-restart.md`. An unbounded `B` degenerates to the
+earlier strategy of starting from the earliest uncommitted `begin_offset`.
 
 **Per-shard RPCs → shared streams**: The legacy system starts an RPC per
 (shard, journal) pair, which doesn't scale: at M=10 shards with N=100k
@@ -200,10 +207,15 @@ target Slice.
 
 ### 4. Journal Reading
 
-The Slice receives `StartRead`, resolves the checkpoint into per-producer
-state and a start offset (minimum uncommitted begin, or maximum committed
-end), and initiates a Gazette streaming read. It first probes the journal
-write head to determine whether the read is already tailing (caught up).
+The Slice receives `StartRead` and resolves the checkpoint (`resolve_checkpoint`)
+into per-producer state, a start offset `R`, and any *gapped* producers. Let
+`M = max(|offset|)` over the checkpoint's producer entries; the read starts at
+`R = min({M} ∪ {F : F uncommitted ∧ M − F ≤ B})`, where `B` is the configured
+near-frontier re-read bound. Uncommitted spans beginning at `F < R` are gapped:
+the main read skips `[F, R)` and the producer is frozen at `F` until it resolves
+(see "Gapped-producer recovery"). The Slice then initiates a Gazette streaming
+read, first probing the journal write head to determine whether it's already
+tailing (caught up).
 
 Read data arrives as `LinesBatch` chunks from Gazette, which are
 transcoded via `simd_doc::SimdParser` into archived document nodes.
@@ -247,6 +259,35 @@ The top document is sequenced against per-producer state using
 - **Duplicates**: Already-seen documents. Silently dropped.
 
 `notBefore` / `notAfter` bounds suppress log appends but not flush cycles and progress reporting.
+
+#### Gapped-producer recovery
+
+A producer whose uncommitted span begins before the resolved start offset `R`
+is *gapped* (`slice/gap.rs`): its recovered `ProducerState` is frozen in
+`settled` and a `GapState` records the pinned span begin `F`. The main read's
+documents for a gapped producer are classified by `sequence_gapped` rather than
+`uuid::sequence` — whose frozen `max_continue == 0` would misreport rollbacks —
+into: suppress (a newer CONTINUE, no state change, `F` preserved), drop (a
+duplicate), a durable clean/deep rollback (an ACK at or below `last_commit`
+clears the gap with a committed `-ack_end`, no historical I/O), a newer OUTSIDE
+that clears the gap, or a backfill trigger (the first committing ACK).
+
+On a trigger the main read *parks* at the ACK: the whole `ReadyRead` is stashed
+in `parked_mains`, and a bounded historical read of `[F, ack_begin)` starts in
+`pending_backfills`, tagged with `BACKFILL_ID_BIT`. Historical documents of the
+target producer are sequenced against the gap's `live` state and appended
+through the normal path; other producers are skipped. When the range is fully
+read, the shelved ACK is sequenced, causal hints extracted, and one flush makes
+the whole recovered transaction visible atomically — `live` never touches
+`pending`/`settled`, so no partial progress can leak into a durable base.
+
+Parked main reads and historical backfill reads live outside `pending_reads`,
+so they are exempt from the all-reads-tailing heap-drain gate and from
+stalled-read accounting: intentional parking and cold-storage I/O never block
+unrelated journals (though shared Log-channel capacity and disk back-pressure
+still apply). Gap state is never persisted; recovery is derived entirely from
+the durable producer checkpoint, and gaps are released when a read stops or the
+session ends.
 
 ### 7. Key Extraction and Append Routing
 
@@ -374,6 +415,7 @@ next one.
   - `listing.rs`: Gazette journal listing subscriber.
   - `producer.rs`: Per-producer state tracking and flush frontier
     construction.
+  - `gap.rs`: Gapped-producer recovery state (skip-ahead + backfill).
   - `read.rs`: ReadState, document metadata extraction, journal probing.
   - `routing.rs`: Clock rotation and shard routing.
   - `heap.rs`: Priority heap for ready reads.
