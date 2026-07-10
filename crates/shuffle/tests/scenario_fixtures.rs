@@ -239,6 +239,35 @@ async fn shuffle_scenarios() {
             .expect("shuffle server error")
     });
 
+    // A second service with re-read bound B = 0, which always skips ahead to the
+    // checkpoint maximum M and so exercises the gapped-producer backfill path
+    // aggressively (spec §Restart resolution). Runs its own gRPC server on a
+    // distinct endpoint so its shard topology routes to it.
+    let listener_b0 = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind B=0 shuffle server");
+    let endpoint_b0 = format!("http://{}", listener_b0.local_addr().unwrap());
+    let factory_b0: gazette::journal::ClientFactory = Arc::new({
+        let journal_client = data_plane.journal_client.clone();
+        move |_authz_sub, _authz_obj| journal_client.clone()
+    });
+    let service_b0 = shuffle::Service::new(
+        endpoint_b0,
+        factory_b0,
+        10 * 1024 * 1024 * 1024,
+        0, // B = 0: always skip to M; gapped spans recover via backfill.
+        service_kit::Registry::new(),
+        None,
+    );
+    let server_b0 = service_b0.clone().build_tonic_server();
+    let server_handle_b0 = tokio::spawn(async move {
+        let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener_b0);
+        server_b0
+            .serve_with_incoming(incoming)
+            .await
+            .expect("B=0 shuffle server error")
+    });
+
     let log_dir = tempfile::tempdir().expect("create temp dir for log segments");
 
     // Run test scenarios sequentially, resetting the data-plane between each.
@@ -331,8 +360,19 @@ async fn shuffle_scenarios() {
         log_dir.path(),
     )
     .await;
+    data_plane.reset().await.expect("reset");
+
+    gapped_backfill(
+        &materialization_spec,
+        &capture_spec,
+        &data_plane.journal_client,
+        &service_b0,
+        log_dir.path(),
+    )
+    .await;
 
     server_handle.abort();
+    server_handle_b0.abort();
     data_plane
         .graceful_stop()
         .await
@@ -1360,4 +1400,127 @@ async fn rollback(
     );
 
     session.close().await.expect("close");
+}
+
+/// Gapped-producer recovery with `B = 0` (spec §Restart resolution, correctness
+/// properties 1–4). P2 opens an uncommitted CONTINUE span, then P1 commits an
+/// OUTSIDE document that advances the checkpoint maximum M past P2's begin F.
+///
+/// Resuming from that checkpoint with `B = 0` skips ahead to M, so P2's span
+/// `[F, M)` is *gapped* and the main read never re-reads it. When P2 later
+/// commits, the Slice parks at P2's ACK, backfills `[F, ack_begin)` — skipping
+/// P1's already-committed document — and delivers P2's span exactly once,
+/// atomically, after which the main read resumes past the ACK.
+async fn gapped_backfill(
+    materialization_spec: &flow::MaterializationSpec,
+    capture_spec: &flow::CaptureSpec,
+    journal_client: &gazette::journal::Client,
+    service: &shuffle::Service, // B = 0
+    log_dir: &std::path::Path,
+) {
+    let phase1_dir = log_dir.join("gapped_backfill_p1");
+    let resume_dir = log_dir.join("gapped_backfill_resume");
+    std::fs::create_dir_all(&phase1_dir).unwrap();
+    std::fs::create_dir_all(&resume_dir).unwrap();
+
+    let p1 = uuid::Producer::from_bytes([0x01, 0x00, 0x00, 0x00, 0x00, 0x01]);
+    let p2 = uuid::Producer::from_bytes([0x03, 0x00, 0x00, 0x00, 0x00, 0x02]);
+    let mut pub1 = make_publisher(capture_spec, journal_client, p1);
+    let mut pub2 = make_publisher(capture_spec, journal_client, p2);
+
+    // P2 opens an uncommitted CONTINUE span (its begin F = 0, journal start).
+    // Writing it before P1's commit ensures the first flushed checkpoint
+    // observes P2 as pending, alongside P1 committed.
+    pub2.enqueue(
+        |uuid| {
+            Ok((
+                0,
+                serde_json::json!({
+                    "_meta": {"uuid": uuid.to_string()},
+                    "id": "g-p2",
+                    "category": "alpha",
+                    "value": 20,
+                }),
+            ))
+        },
+        uuid::Flags::CONTINUE_TXN,
+    )
+    .await
+    .unwrap();
+    pub2.flush().await.unwrap();
+
+    // P1 commits an OUTSIDE document, advancing M past F. With B = 0 the resume
+    // read then starts at M rather than P2's span begin — the acceptance
+    // criterion — and P2 (F = 0 < R = M) is gapped. F = 0 additionally
+    // exercises the deliberately-conservative offset==0 classification.
+    pub1.enqueue(
+        |uuid| {
+            Ok((
+                0,
+                serde_json::json!({
+                    "_meta": {"uuid": uuid.to_string()},
+                    "id": "g-p1",
+                    "category": "alpha",
+                    "value": 10,
+                }),
+            ))
+        },
+        uuid::Flags::OUTSIDE_TXN,
+    )
+    .await
+    .unwrap();
+    pub1.flush().await.unwrap();
+
+    // Session 1: capture a checkpoint with P1 committed and P2 pending (F).
+    let mut session = shuffle::SessionClient::open(
+        service,
+        build_task(materialization_spec),
+        build_shards(1, service.peer_endpoint(), &phase1_dir),
+        Default::default(),
+    )
+    .await
+    .expect("SessionClient::open phase 1");
+
+    let frontier1 = next_resolved_checkpoint(&mut session, "gapped phase 1").await;
+    let mut shard_state: ShardState = (0..1).map(|_| None).collect();
+    let read1 = collect_read_entries(&frontier1, &phase1_dir, &mut shard_state);
+    insta::assert_debug_snapshot!(
+        "gapped_backfill_checkpoint1",
+        Checkpoint {
+            frontier: &frontier1,
+            read: read1,
+        }
+    );
+    session.close().await.expect("close phase 1");
+
+    // Resume with B = 0: P2 (F < R = M) is gapped; its span is skipped.
+    let mut resumed = shuffle::SessionClient::open(
+        service,
+        build_task(materialization_spec),
+        build_shards(1, service.peer_endpoint(), &resume_dir),
+        frontier1.clone(),
+    )
+    .await
+    .expect("SessionClient::open resumed");
+
+    // P2 now commits its pending transaction. The main read reaches P2's ACK,
+    // triggers a backfill of [F, ack_begin), and delivers P2's span.
+    let (producer, commit_clock, journals) = pub2.commit_intents();
+    let acks = publisher::intents::build_transaction_intents(&[(producer, commit_clock, journals)]);
+    pub2.write_intents(acks).await.unwrap();
+
+    let frontier2 = next_resolved_checkpoint(&mut resumed, "gapped backfill").await;
+    let mut resumed_shard_state: ShardState = (0..1).map(|_| None).collect();
+    let read2 = collect_read_entries(&frontier2, &resume_dir, &mut resumed_shard_state);
+    // The reader must yield exactly P2's recovered document (g-p2) — once —
+    // and never re-yield P1's already-committed document.
+    insta::assert_debug_snapshot!(
+        "gapped_backfill_resumed",
+        Checkpoint {
+            frontier: &frontier2,
+            read: read2,
+        }
+    );
+
+    resumed.close().await.expect("close resumed");
 }
