@@ -839,6 +839,92 @@ mod test {
     }
 
     #[test]
+    fn test_sequence_gapped_outcome_table() {
+        use GappedOutcome::*;
+        let lc = Clock::from_u64(100);
+        let p = producer(0x01);
+
+        // (flags, clock, expected) — the complete normative outcome table for a
+        // gapped producer's main-read documents (spec §Main-read outcomes).
+        let cases: &[(Flags, u64, GappedOutcome)] = &[
+            (CONTINUE, 150, Suppress),      // ContinueBeginSpan
+            (CONTINUE, 100, Drop),          // ContinueDuplicate (== last_commit)
+            (CONTINUE, 50, Drop),           // ContinueDuplicate (< last_commit)
+            (ACK, 150, TriggerBackfill),    // AckEmpty → park + backfill
+            (ACK, 100, CleanRollback),      // AckDuplicate → durable clean rollback
+            (ACK, 50, DeepRollback),        // AckDuplicate → durable deep rollback
+            (OUTSIDE, 150, OutsideResolve), // OutsideCommit → discard gap, reprocess
+            (OUTSIDE, 100, Drop),           // OutsideDuplicate (== last_commit)
+            (OUTSIDE, 50, Drop),            // OutsideDuplicate (< last_commit)
+        ];
+        for (flags, clock, expected) in cases {
+            let m = meta(p, Clock::from_u64(*clock), *flags, 0, 10);
+            assert_eq!(
+                sequence_gapped(lc, &m),
+                *expected,
+                "flags={flags:?} clock={clock}",
+            );
+        }
+    }
+
+    #[test]
+    fn test_gapped_rollback_is_durable() {
+        // A gapped clean/deep rollback emits a committed entry (offset =
+        // -ack_end). Re-resolving that checkpoint must not recreate the gap
+        // (spec correctness property 5), even when other producers raise M.
+        let p = producer(0x01);
+        let p2 = producer(0x03);
+
+        let r = resolve_checkpoint(vec![cp(&p, -450)], 0);
+        assert!(r.gaps.is_empty(), "committed offset is never gapped");
+
+        let r = resolve_checkpoint(vec![cp(&p, -450), cp(&p2, -100_000)], 0);
+        assert!(
+            !r.gaps.contains_key(&p),
+            "rolled-back producer stays committed across restart",
+        );
+    }
+
+    #[test]
+    fn test_backfill_intermediate_commit_is_detected() {
+        // The backfill drain path sequences target-producer documents against
+        // the gap's `live` state and bails when `sequence_producer` reports a
+        // commit — a distinct committing ACK inside the historical range
+        // contradicts the recovered checkpoint (spec §One-transaction invariant).
+        let binding = test_binding(0, true, None, "/suffix");
+        let p = producer(0x01);
+
+        let live = ProducerState {
+            last_commit: Clock::from_u64(100),
+            max_continue: Clock::zero(),
+            offset: 200,
+        };
+        // A CONTINUE extends the reconstructed span — not a commit.
+        let s = sequence_producer(
+            live,
+            "test/journal",
+            &binding,
+            &meta(p, Clock::from_u64(150), CONTINUE, 200, 210),
+        )
+        .unwrap();
+        assert!(!s.is_commit, "CONTINUE within the range is not a commit");
+
+        // A committing ACK within the range reports is_commit; the actor treats
+        // this as a terminal consistency error and bails.
+        let s2 = sequence_producer(
+            s.producer_state,
+            "test/journal",
+            &binding,
+            &meta(p, Clock::from_u64(150), ACK, 210, 220),
+        )
+        .unwrap();
+        assert!(
+            s2.is_commit,
+            "a committing ACK inside the range is detectable (actor bails)",
+        );
+    }
+
+    #[test]
     fn test_sequence_not_before_not_after() {
         let mut bindings = vec![test_binding(0, true, None, "/suffix")];
         bindings[0].not_before = Clock::from_u64(100);
