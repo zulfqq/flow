@@ -36,6 +36,12 @@ struct TestCase {
     num_shards: usize,
     num_producers: usize,
     rounds: Vec<Round>,
+    /// When true, the shard topology routes to a Service with re-read bound
+    /// B = 0, which always skips ahead to the checkpoint maximum M — so a stale
+    /// open span surviving a crash is gapped and recovered via backfill. When
+    /// false, an unbounded B reproduces the conservative min-uncommitted-begin
+    /// strategy.
+    b_zero: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -52,6 +58,13 @@ enum Action {
     ContinueAck { continues: Vec<PartitionId> },
     /// Write one or more CONTINUE_TXN documents, then rollback. Retires the producer.
     ContinueRollback { continues: Vec<PartitionId> },
+    /// Write one or more CONTINUE_TXN documents and leave the span *open* (no
+    /// ACK). If a crash intervenes before the span commits, it becomes a stale
+    /// open span in the recovery checkpoint — the gapped-producer case.
+    ContinueOnly { continues: Vec<PartitionId> },
+    /// Commit a previously-opened span with an ACK. Only valid for a producer
+    /// with an open span. Under B = 0 across a crash, this triggers a backfill.
+    CommitOpen,
 }
 
 // ---------------------------------------------------------------------------
@@ -64,7 +77,18 @@ impl Arbitrary for TestCase {
         let num_producers = 1 + usize::arbitrary(g) % MAX_PRODUCERS;
         let num_rounds = 1 + usize::arbitrary(g) % MAX_ROUNDS;
         let mut retired: HashSet<ProducerId> = HashSet::new();
+        // Producers with an uncommitted span opened by a prior ContinueOnly.
+        // They must not write OUTSIDE (which would error against a pending
+        // span); they may keep the span open, commit it, or roll it back.
+        let mut open: HashSet<ProducerId> = HashSet::new();
         let mut rounds = Vec::with_capacity(num_rounds);
+
+        let random_continues = |g: &mut quickcheck::Gen| -> Vec<PartitionId> {
+            let n = 1 + usize::arbitrary(g) % MAX_CONTINUES;
+            (0..n)
+                .map(|_| (usize::arbitrary(g) % NUM_PARTITIONS) as u8)
+                .collect()
+        };
 
         for _ in 0..num_rounds {
             let mut actions = HashMap::new();
@@ -73,30 +97,48 @@ impl Arbitrary for TestCase {
                 if retired.contains(&prod_id) {
                     continue;
                 }
+
+                // A producer with an open span must resolve it before anything
+                // else: commit, roll back (retire), or keep it open for now.
+                if open.contains(&prod_id) {
+                    match usize::arbitrary(g) % 4 {
+                        0 => continue, // NoOp: keep the span open across the round.
+                        1 => {
+                            open.remove(&prod_id);
+                            retired.insert(prod_id);
+                            actions.insert(prod_id, Action::ContinueRollback { continues: vec![] });
+                        }
+                        _ => {
+                            open.remove(&prod_id);
+                            actions.insert(prod_id, Action::CommitOpen);
+                        }
+                    }
+                    continue;
+                }
+
                 // ~50% chance of NoOp (absent from map).
                 if bool::arbitrary(g) {
                     continue;
                 }
 
-                let action = match usize::arbitrary(g) % 3 {
+                let action = match usize::arbitrary(g) % 4 {
                     0 => Action::OutsideTxn {
                         partition: (usize::arbitrary(g) % NUM_PARTITIONS) as u8,
                     },
-                    1 => {
-                        let num_continues = 1 + usize::arbitrary(g) % MAX_CONTINUES;
-                        let continues = (0..num_continues)
-                            .map(|_| (usize::arbitrary(g) % NUM_PARTITIONS) as u8)
-                            .collect();
-                        Action::ContinueAck { continues }
+                    1 => Action::ContinueAck {
+                        continues: random_continues(g),
+                    },
+                    2 => {
+                        // Open a span without committing — a candidate stale
+                        // open span if a crash intervenes before it commits.
+                        open.insert(prod_id);
+                        Action::ContinueOnly {
+                            continues: random_continues(g),
+                        }
                     }
                     _ => {
-                        // Rollback is less likely: only pick it ~25% of the time
-                        // (1/3 chance to reach this arm, then 75% downgrade to ContinueAck).
-                        let num_continues = 1 + usize::arbitrary(g) % MAX_CONTINUES;
-                        let continues: Vec<PartitionId> = (0..num_continues)
-                            .map(|_| (usize::arbitrary(g) % NUM_PARTITIONS) as u8)
-                            .collect();
-
+                        // Rollback is less likely: ~25% of this arm.
+                        let continues = random_continues(g);
                         if bool::arbitrary(g) && bool::arbitrary(g) {
                             retired.insert(prod_id);
                             Action::ContinueRollback { continues }
@@ -116,6 +158,7 @@ impl Arbitrary for TestCase {
             num_shards,
             num_producers,
             rounds,
+            b_zero: bool::arbitrary(g),
         }
     }
 
@@ -139,7 +182,11 @@ struct SharedHarness {
     journal_client: gazette::journal::Client,
     /// Path to the gazette fragment store, used by reset_data_plane.
     fragment_root: std::path::PathBuf,
+    /// Service with an unbounded re-read bound B (conservative recovery).
     service: shuffle::Service,
+    /// Service with B = 0, which skips ahead to M and recovers stale open spans
+    /// via backfill. Runs its own gRPC server on a distinct endpoint.
+    service_b0: shuffle::Service,
     materialization_spec: flow::MaterializationSpec,
     capture_spec: flow::CaptureSpec,
     log_dir: tempfile::TempDir,
@@ -169,83 +216,117 @@ fn get_harness() -> &'static SharedHarness {
             .build()
             .expect("build tokio runtime");
 
-        let (data_plane, service, materialization_spec, capture_spec, log_dir, server_handle) =
-            runtime.block_on(async {
-                let source =
-                    build::arg_source_to_url("./tests/shuffle_fuzz.flow.yaml", false).unwrap();
-                let build_output = Arc::new(
-                    build::for_local_test(&source, true)
-                        .await
-                        .into_result()
-                        .expect("build catalog fixture"),
-                );
-
-                let materialization_spec = build_output
-                    .built
-                    .built_materializations
-                    .get_by_key(&models::Materialization::new(
-                        "testing/fuzz-materialization",
-                    ))
-                    .expect("built materialization")
-                    .spec
-                    .as_ref()
-                    .expect("materialization spec")
-                    .clone();
-
-                let capture_spec = build_output
-                    .built
-                    .built_captures
-                    .get_by_key(&models::Capture::new("testing/fuzz-capture"))
-                    .expect("built capture")
-                    .spec
-                    .as_ref()
-                    .expect("capture spec")
-                    .clone();
-
-                let data_plane = e2e_support::DataPlane::start(Default::default())
+        let (
+            data_plane,
+            service,
+            service_b0,
+            materialization_spec,
+            capture_spec,
+            log_dir,
+            server_handle,
+        ) = runtime.block_on(async {
+            let source = build::arg_source_to_url("./tests/shuffle_fuzz.flow.yaml", false).unwrap();
+            let build_output = Arc::new(
+                build::for_local_test(&source, true)
                     .await
-                    .expect("DataPlane start");
+                    .into_result()
+                    .expect("build catalog fixture"),
+            );
 
-                let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-                    .await
-                    .expect("bind shuffle server");
-                let endpoint = format!("http://{}", listener.local_addr().unwrap());
+            let materialization_spec = build_output
+                .built
+                .built_materializations
+                .get_by_key(&models::Materialization::new(
+                    "testing/fuzz-materialization",
+                ))
+                .expect("built materialization")
+                .spec
+                .as_ref()
+                .expect("materialization spec")
+                .clone();
 
-                let factory: gazette::journal::ClientFactory = Arc::new({
-                    let journal_client = data_plane.journal_client.clone();
-                    move |_authz_sub, _authz_obj| journal_client.clone()
-                });
-                let service = shuffle::Service::new(
-                    endpoint,
-                    factory,
-                    10 * 1024 * 1024 * 1024,
-                    // Unbounded re-read bound "B" for now; Phase 3 introduces a
-                    // dual-B harness (0 and non-zero) to exercise backfill.
-                    u64::MAX,
-                    service_kit::Registry::new(),
-                    None, // Tests run the shuffle fan-out unauthenticated.
-                );
+            let capture_spec = build_output
+                .built
+                .built_captures
+                .get_by_key(&models::Capture::new("testing/fuzz-capture"))
+                .expect("built capture")
+                .spec
+                .as_ref()
+                .expect("capture spec")
+                .clone();
 
-                let server = service.clone().build_tonic_server();
-                let server_handle = tokio::spawn(async move {
-                    let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
-                    server
-                        .serve_with_incoming(incoming)
-                        .await
-                        .expect("shuffle server error")
-                });
+            let data_plane = e2e_support::DataPlane::start(Default::default())
+                .await
+                .expect("DataPlane start");
 
-                let log_dir = tempfile::tempdir().expect("create temp dir");
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind shuffle server");
+            let endpoint = format!("http://{}", listener.local_addr().unwrap());
 
-                (
-                    data_plane,
-                    service,
-                    materialization_spec,
-                    capture_spec,
-                    log_dir,
-                    server_handle,
-                )
+            let factory: gazette::journal::ClientFactory = Arc::new({
+                let journal_client = data_plane.journal_client.clone();
+                move |_authz_sub, _authz_obj| journal_client.clone()
             });
+            let service = shuffle::Service::new(
+                endpoint,
+                factory,
+                10 * 1024 * 1024 * 1024,
+                // Unbounded re-read bound "B": conservative recovery.
+                u64::MAX,
+                service_kit::Registry::new(),
+                None, // Tests run the shuffle fan-out unauthenticated.
+            );
+
+            let server = service.clone().build_tonic_server();
+            let server_handle = tokio::spawn(async move {
+                let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
+                server
+                    .serve_with_incoming(incoming)
+                    .await
+                    .expect("shuffle server error")
+            });
+
+            // A second service with B = 0, exercised by test cases with
+            // `b_zero`, so stale open spans surviving a crash are recovered
+            // via backfill rather than a conservative re-read.
+            let listener_b0 = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind B=0 shuffle server");
+            let endpoint_b0 = format!("http://{}", listener_b0.local_addr().unwrap());
+            let factory_b0: gazette::journal::ClientFactory = Arc::new({
+                let journal_client = data_plane.journal_client.clone();
+                move |_authz_sub, _authz_obj| journal_client.clone()
+            });
+            let service_b0 = shuffle::Service::new(
+                endpoint_b0,
+                factory_b0,
+                10 * 1024 * 1024 * 1024,
+                0, // B = 0.
+                service_kit::Registry::new(),
+                None,
+            );
+            let server_b0 = service_b0.clone().build_tonic_server();
+            tokio::spawn(async move {
+                let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener_b0);
+                server_b0
+                    .serve_with_incoming(incoming)
+                    .await
+                    .expect("B=0 shuffle server error")
+            });
+
+            let log_dir = tempfile::tempdir().expect("create temp dir");
+
+            (
+                data_plane,
+                service,
+                service_b0,
+                materialization_spec,
+                capture_spec,
+                log_dir,
+                server_handle,
+            )
+        });
 
         let journal_client = data_plane.journal_client.clone();
         let fragment_root = data_plane.gazette.fragment_root.clone();
@@ -255,6 +336,7 @@ fn get_harness() -> &'static SharedHarness {
             journal_client,
             fragment_root,
             service,
+            service_b0,
             materialization_spec,
             capture_spec,
             log_dir,
@@ -538,6 +620,50 @@ async fn write_actions(
                 state.last_committed_clock = commit_clock;
                 commit_clocks.insert(prod_id, commit_clock);
             }
+            Action::ContinueOnly { continues } => {
+                // Write CONTINUEs and leave the span open (no ACK).
+                for &partition in continues {
+                    let counter = state.counter;
+                    state
+                        .publisher
+                        .enqueue(
+                            |u| {
+                                Ok((
+                                    0,
+                                    serde_json::json!({
+                                        "_meta": {"uuid": u.to_string()},
+                                        "id": format!("p{prod_id}-c{counter}"),
+                                        "category": PARTITION_CATEGORIES[partition as usize],
+                                        "counter": counter,
+                                    }),
+                                ))
+                            },
+                            uuid::Flags::CONTINUE_TXN,
+                        )
+                        .await
+                        .unwrap();
+                    state.counter += 1;
+                }
+                state.publisher.flush().await.unwrap();
+                // No commit: the span stays open across rounds/crashes.
+            }
+            Action::CommitOpen => {
+                // ACK the previously-opened span. No new CONTINUEs.
+                let (producer_id, commit_clock, journals) = state.publisher.commit_intents();
+                let intents = publisher::intents::build_transaction_intents(&[(
+                    producer_id,
+                    commit_clock,
+                    journals,
+                )]);
+                for (journal, _) in &intents {
+                    state
+                        .journal_committed_clocks
+                        .insert(journal.clone(), commit_clock);
+                }
+                state.publisher.write_intents(intents).await.unwrap();
+                state.last_committed_clock = commit_clock;
+                commit_clocks.insert(prod_id, commit_clock);
+            }
             Action::ContinueRollback { continues } => {
                 for &partition in continues {
                     let counter = state.counter;
@@ -620,6 +746,17 @@ fn record_oracle_with_counters(
                     counter += 1;
                 }
                 oracle.record_ack_rollback(prod_id);
+            }
+            Action::ContinueOnly { continues } => {
+                // Docs are pending, not yet committed — no round_expected here.
+                for &partition in continues {
+                    oracle.record_continue(prod_id, counter, partition);
+                    counter += 1;
+                }
+            }
+            Action::CommitOpen => {
+                // Commits the pending span accumulated by a prior ContinueOnly.
+                oracle.record_ack_commit(prod_id);
             }
         }
     }
@@ -788,22 +925,24 @@ async fn run_test_case_inner(
 
     let mut oracle = Oracle::new();
     let task = build_task(&harness.materialization_spec);
+    // Route the topology to the B=0 or unbounded-B Service per the test case.
+    let service = if test_case.b_zero {
+        &harness.service_b0
+    } else {
+        &harness.service
+    };
     let shards = build_shards(
         test_case.num_shards as u32,
-        harness.service.peer_endpoint(),
+        service.peer_endpoint(),
         log_dir,
     );
 
     let mut recovery = shuffle::Frontier::default();
     tracing::debug!("  opening initial session...");
-    let mut session = shuffle::SessionClient::open(
-        &harness.service,
-        task.clone(),
-        shards.clone(),
-        recovery.clone(),
-    )
-    .await
-    .map_err(|e| format!("SessionClient::open: {e}"))?;
+    let mut session =
+        shuffle::SessionClient::open(service, task.clone(), shards.clone(), recovery.clone())
+            .await
+            .map_err(|e| format!("SessionClient::open: {e}"))?;
     tracing::debug!("  session opened");
 
     let mut shard_state: Vec<Option<(Reader, VecDeque<Remainder>)>> =
@@ -838,8 +977,9 @@ async fn run_test_case_inner(
                 let data_actions = match round.actions.get(&id) {
                     Some(Action::OutsideTxn { .. }) => 1u64,
                     Some(Action::ContinueAck { continues })
-                    | Some(Action::ContinueRollback { continues }) => continues.len() as u64,
-                    None => 0,
+                    | Some(Action::ContinueRollback { continues })
+                    | Some(Action::ContinueOnly { continues }) => continues.len() as u64,
+                    Some(Action::CommitOpen) | None => 0,
                 };
                 (id, state.counter - data_actions)
             })
@@ -853,7 +993,7 @@ async fn run_test_case_inner(
             .filter(|(_, action)| {
                 matches!(
                     action,
-                    Action::OutsideTxn { .. } | Action::ContinueAck { .. }
+                    Action::OutsideTxn { .. } | Action::ContinueAck { .. } | Action::CommitOpen
                 )
             })
             .map(|(&id, _)| (id, producers[&id].last_committed_clock))
@@ -921,7 +1061,7 @@ async fn run_test_case_inner(
             shard_state = (0..test_case.num_shards).map(|_| None).collect();
 
             session = shuffle::SessionClient::open(
-                &harness.service,
+                service,
                 task.clone(),
                 shards.clone(),
                 recovery.clone(),
