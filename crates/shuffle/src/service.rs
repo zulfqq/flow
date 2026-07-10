@@ -11,6 +11,23 @@ use tokio::sync::mpsc;
 /// this default per-shard via the `estuary.dev/shuffle-disk-limit` label.
 pub const DEFAULT_SHUFFLE_DISK_LIMIT_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
+/// Default near-frontier conservative re-read bound "B", in bytes (1 GiB).
+///
+/// On restart, each `(binding, journal)` read begins at most this many bytes
+/// behind the furthest position justified by its checkpoint (`M`). Uncommitted
+/// producer spans that begin further back are classified as *gapped* and
+/// recovered lazily via targeted backfill rather than a whole-journal re-read
+/// (see `plans/shuffle-gapped-restart.md` §Restart resolution).
+///
+/// The value is deliberately below the recovery-time prune byte horizon
+/// (`FRONTIER_PRUNE_BYTE_HORIZON`, 2 GiB): entries beyond that horizon (and past
+/// the clock horizon) are pruned before a Slice ever sees them, so they never
+/// become gaps. Keeping `B` comfortably under the horizon ensures the bounded
+/// re-read window remains meaningful. A larger value trades more one-pass
+/// conservative re-read for fewer backfills; `B = 0` always skips to `M` and is
+/// used by tests to exercise the backfill path aggressively.
+pub const DEFAULT_REREAD_BOUND_BYTES: u64 = 1024 * 1024 * 1024;
+
 /// Service is the implementation of the Shuffle gRPC service trait.
 #[derive(Clone)]
 pub struct Service(Arc<ServiceImpl>);
@@ -25,6 +42,12 @@ pub struct ServiceImpl {
     /// back-pressure, used for any task that doesn't set a per-shard override
     /// via the `estuary.dev/shuffle-disk-limit` label.
     pub(crate) shuffle_disk_limit_bytes: u64,
+    /// Near-frontier conservative re-read bound "B", in bytes, applied when a
+    /// Slice resolves each of its `StartRead` checkpoints. Process-level config
+    /// rather than a per-shard proto field: the spec forbids protocol changes,
+    /// and a Slice resolves all its reads against the one `Service` that spawned
+    /// it, satisfying per-Slice-session consistency.
+    pub(crate) reread_bound_bytes: u64,
     /// Transport channels to dialed peers.
     pub(crate) channels: std::sync::Mutex<HashMap<String, tonic::transport::Channel>>,
     /// Shared state for coordinating Log RPCs from multiple Slices into a single LogActor.
@@ -41,6 +64,7 @@ impl Service {
         peer_endpoint: String,
         journal_client_factory: gazette::journal::ClientFactory,
         shuffle_disk_limit_bytes: u64,
+        reread_bound_bytes: u64,
         registry: service_kit::Registry,
         signer: Option<proto_grpc::Signer>,
     ) -> Self {
@@ -48,6 +72,7 @@ impl Service {
             peer_endpoint,
             journal_client_factory,
             shuffle_disk_limit_bytes,
+            reread_bound_bytes,
             channels: std::sync::Mutex::new(HashMap::new()),
             log_joins: std::sync::Mutex::new(HashMap::new()),
             registry,
@@ -67,6 +92,7 @@ impl Service {
             peer_endpoint,
             journal_client_factory,
             DEFAULT_SHUFFLE_DISK_LIMIT_BYTES,
+            DEFAULT_REREAD_BOUND_BYTES,
             registry,
             None, // No AuthN+AuthZ signer (local loopback).
         )

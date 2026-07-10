@@ -188,6 +188,7 @@ mod test {
             journal: journal.into(),
             settled: ProducerMap::default(),
             pending: map,
+            gaps: Default::default(),
             read_offset,
             prev_read_offset,
             write_head,

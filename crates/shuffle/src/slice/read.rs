@@ -1,3 +1,4 @@
+use super::gap::GapState;
 use super::producer::ProducerState;
 use crate::ProducerMap;
 use proto_gazette::{broker, uuid};
@@ -20,6 +21,12 @@ pub struct ReadState {
     /// Producers updated since the last flush cycle started.
     /// Drained into `settled` at the start of each flush.
     pub pending: ProducerMap<ProducerState>,
+    /// Producers classified as gapped during checkpoint recovery, and their
+    /// in-session backfill state. A gapped producer's frozen `ProducerState`
+    /// remains in `settled` (its single source of truth for `last_commit`),
+    /// while this map tracks the skipped span and any active backfill. Empty in
+    /// the common case where no producer was gapped.
+    pub gaps: ProducerMap<GapState>,
     /// End offset of most recently processed document.
     pub read_offset: i64,
     /// Read offset as of last flush (baseline for bytes_read_delta).
@@ -31,18 +38,20 @@ pub struct ReadState {
 }
 
 impl ReadState {
-    /// Construct a `ReadState` for a read with `settled` producers recovered
-    /// from its checkpoint.
+    /// Construct a `ReadState` for a read with `settled` producers and `gaps`
+    /// recovered from its checkpoint.
     pub fn recovered(
         binding_index: u16,
         journal: Box<str>,
         settled: ProducerMap<ProducerState>,
+        gaps: ProducerMap<GapState>,
     ) -> Self {
         Self {
             binding_index,
             journal,
             settled,
             pending: Default::default(),
+            gaps,
             read_offset: 0,
             prev_read_offset: 0,
             write_head: 0,
@@ -70,7 +79,7 @@ impl ReadState {
 }
 
 /// Metadata about a document in a ReadyRead batch.
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub struct Meta {
     /// Begin offset (inclusive) of `doc` within the journal.
     pub begin_offset: i64,

@@ -67,7 +67,7 @@ pub const FLAGS_SCHEMA_VALID: u16 = 0x8000;
 pub use binding::Binding;
 pub use client::SessionClient;
 pub use frontier::{Frontier, JournalFrontier, ProducerFrontier};
-pub use service::{DEFAULT_SHUFFLE_DISK_LIMIT_BYTES, Service};
+pub use service::{DEFAULT_REREAD_BOUND_BYTES, DEFAULT_SHUFFLE_DISK_LIMIT_BYTES, Service};
 
 /// Return the current wall-clock time as a `uuid::Clock`.
 ///

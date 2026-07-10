@@ -219,6 +219,9 @@ fn get_harness() -> &'static SharedHarness {
                     endpoint,
                     factory,
                     10 * 1024 * 1024 * 1024,
+                    // Unbounded re-read bound "B" for now; Phase 3 introduces a
+                    // dual-B harness (0 and non-zero) to exercise backfill.
+                    u64::MAX,
                     service_kit::Registry::new(),
                     None, // Tests run the shuffle fan-out unauthenticated.
                 );

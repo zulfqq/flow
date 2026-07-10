@@ -223,6 +223,9 @@ async fn shuffle_scenarios() {
         endpoint.clone(),
         factory,
         10 * 1024 * 1024 * 1024,
+        // Unbounded re-read bound "B": degenerates to the min-uncommitted-begin
+        // strategy, matching the conservative recovery these fixtures assert.
+        u64::MAX,
         service_kit::Registry::new(),
         None, // Tests run the shuffle fan-out unauthenticated.
     );
