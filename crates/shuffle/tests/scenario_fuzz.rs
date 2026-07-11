@@ -521,11 +521,10 @@ async fn write_actions(
                 }
                 state.publisher.flush().await.unwrap();
                 let (producer_id, commit_clock, journals) = state.publisher.commit_intents();
-                let intents = publisher::intents::build_transaction_intents(&[(
-                    producer_id,
-                    commit_clock,
-                    journals,
-                )]);
+                let intents = publisher::intents::build_transaction_intents(
+                    &[(producer_id, commit_clock, journals)],
+                    None,
+                );
                 for (journal, _) in &intents {
                     state
                         .journal_committed_clocks
@@ -675,6 +674,7 @@ fn project_hints(round_frontier: &shuffle::Frontier) -> shuffle::Frontier {
         unresolved_hints,
         journals,
         flushed_lsn: vec![],
+        ..Default::default()
     }
 }
 
@@ -861,6 +861,7 @@ async fn run_test_case_inner(
             journals: vec![],
             flushed_lsn: recovery.flushed_lsn.clone(),
             unresolved_hints: 0,
+            ..Default::default()
         };
 
         // STEP 3: POLL CHECKPOINTS.
@@ -930,6 +931,7 @@ async fn run_test_case_inner(
                 journals: vec![],
                 flushed_lsn: recovery.flushed_lsn.clone(),
                 unresolved_hints: 0,
+                ..Default::default()
             };
 
             if recovery.unresolved_hints != 0 {
