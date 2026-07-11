@@ -159,6 +159,10 @@ impl RocksDB {
                 let mut recover = proto::Recover::default();
                 let mut committed_frontier: Vec<shuffle::JournalFrontier> = Vec::new();
                 let mut hinted_frontier: Vec<shuffle::JournalFrontier> = Vec::new();
+                let mut committed_backfill_begin = std::collections::BTreeMap::new();
+                let mut committed_backfill_complete = std::collections::BTreeMap::new();
+                let mut hinted_backfill_begin = std::collections::BTreeMap::new();
+                let mut hinted_backfill_complete = std::collections::BTreeMap::new();
 
                 let mut it = self.db.raw_iterator();
                 it.seek_to_first();
@@ -168,6 +172,10 @@ impl RocksDB {
                         &mut recover,
                         &mut committed_frontier,
                         &mut hinted_frontier,
+                        &mut committed_backfill_begin,
+                        &mut committed_backfill_complete,
+                        &mut hinted_backfill_begin,
+                        &mut hinted_backfill_complete,
                         key,
                         value,
                         &binding_state_keys,
@@ -220,6 +228,16 @@ impl RocksDB {
                     *slot =
                         (!frontier.is_empty()).then(|| shuffle::JournalFrontier::encode(&frontier));
                 }
+
+                // Fold the persisted backfill clocks onto the recovered committed
+                // and hinted Frontiers (keyed by binding index).
+                recovery::restore_backfill_clocks(
+                    &mut recover,
+                    committed_backfill_begin,
+                    committed_backfill_complete,
+                    hinted_backfill_begin,
+                    hinted_backfill_complete,
+                );
 
                 Ok((self, recover))
             })
@@ -513,7 +531,7 @@ fn do_merge_bounded(
             memtable.alloc(),
             [doc::HeapNode::String(key), op].into_iter(),
         );
-        memtable.add(0, doc, false)?;
+        memtable.add(0, doc, false, 0)?;
         consumed += 1;
 
         let bytes_used = memtable
@@ -527,7 +545,7 @@ fn do_merge_bounded(
     }
 
     let mut out = Vec::new();
-    for (index, drained) in memtable.try_into_drainer()?.enumerate() {
+    for (index, drained) in memtable.try_into_drainer(None)?.enumerate() {
         let doc::combine::DrainedDoc { meta: _, root } = drained?;
         let doc::OwnedNode::Heap(root) = root else {
             unreachable!()
