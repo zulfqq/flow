@@ -30,10 +30,25 @@ impl ProducerFrontier {
         // resolved entry is reduced into `ready`, the elevated `last_commit` would
         // win and its zero offset would overwrite the actual journal position from
         // the read-derived side.
-        let offset = if self.offset.abs() >= other.offset.abs() {
-            self.offset
+        //
+        // On equal magnitude, prefer the non-negative (uncommitted begin) side.
+        // A producer's next span begins exactly at its previous transaction's
+        // committed end offset whenever no other producer appended in between,
+        // so a `+F` span begin routinely ties with the prior committed `-O`
+        // (F == O) — and the span begin is the strictly newer state. Preferring
+        // the committed side would erase the open span from the durable
+        // checkpoint entirely: a later checkpoint-derived restart then has no
+        // entry to gap or re-read, and silently skips the span's documents.
+        // (Rollback resolution is unaffected: a resolving ACK's `-ack_end` is
+        // strictly greater in magnitude than the span begin `F` it clears.)
+        let offset = if self.offset.abs() != other.offset.abs() {
+            if self.offset.abs() > other.offset.abs() {
+                self.offset
+            } else {
+                other.offset
+            }
         } else {
-            other.offset
+            self.offset.max(other.offset)
         };
         Self {
             producer: self.producer,
@@ -606,6 +621,14 @@ mod test {
             ((100, 0, -300), (100, 0, 50), (100, 0, -300)),
             // Default offset=0 (e.g. from hint) does not override meaningful offset.
             ((200, 0, -800), (0, 500, 0), (200, 500, -800)),
+            // Equal magnitude: the uncommitted (non-negative) span begin wins,
+            // in either argument order. A producer's next span begins exactly
+            // at its previous committed end offset, so this tie is routine —
+            // and preferring the committed side would erase the open span from
+            // the durable checkpoint, silently skipping its documents on a
+            // checkpoint-derived restart.
+            ((100, 0, -500), (100, 0, 500), (100, 0, 500)),
+            ((100, 0, 500), (100, 0, -500), (100, 0, 500)),
         ];
 
         for (a, b, expect) in cases {
