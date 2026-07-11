@@ -30,6 +30,10 @@ pub(super) struct Startup<P: crate::Publisher, S: crate::leader::ShuffleSession,
     pub session: S,
     // Task definition.
     pub task: Task,
+    // Leader's initial cumulative backfill-begin boundary (committed ∪ hinted).
+    pub backfill_begin: BTreeMap<u16, uuid::Clock>,
+    // Leader's initial cumulative backfill-complete boundary (committed ∪ hinted).
+    pub backfill_complete: BTreeMap<u16, uuid::Clock>,
 }
 
 #[tracing::instrument(
@@ -124,6 +128,7 @@ pub(super) async fn run<
         legacy_checkpoint,
         max_keys,
         trigger_params_json: pending_trigger_params,
+        active_backfills: _, // capture-only state
     } = recv_recovers(shard_rx, &task.peers)
         .await
         .context("receiving Recover fan-in")?;
@@ -203,6 +208,8 @@ pub(super) async fn run<
         resume_frontier,
         idempotent_replay,
         cleanup_persist,
+        backfill_begin,
+        backfill_complete,
     } = reconcile_recovered(
         drop_v1_rollback,
         committed_close,
@@ -248,6 +255,8 @@ pub(super) async fn run<
         publisher,
         session,
         task,
+        backfill_begin,
+        backfill_complete,
     })
 }
 
@@ -268,6 +277,9 @@ struct Reconciled {
     /// Startup cleanup `Persist` to durably reconcile RocksDB, or `None` when
     /// nothing needs reconciling.
     cleanup_persist: Option<proto::Persist>,
+    /// Leader's initial cumulative backfill boundaries (committed ∪ hinted).
+    backfill_begin: BTreeMap<u16, uuid::Clock>,
+    backfill_complete: BTreeMap<u16, uuid::Clock>,
 }
 
 /// Reconcile the RocksDB-recovered frontiers (`committed_frontier`,
@@ -290,6 +302,12 @@ fn reconcile_recovered(
     mut pending_ack_intents: BTreeMap<String, Bytes>,
     journal_read_suffix_index: &[(&str, usize)],
 ) -> anyhow::Result<Reconciled> {
+    // A `checkpoint_to_frontier` rebuild below replaces `committed_frontier`,
+    // dropping its backfill truncation boundary; capture it to re-apply, since the
+    // boundary is source-journal state, independent of the recovered checkpoint.
+    let recovered_backfill_begin = committed_frontier.latest_backfill_begin.clone();
+    let recovered_backfill_complete = committed_frontier.latest_backfill_complete.clone();
+
     // Set when a recovered checkpoint (legacy V1 or connector) is authoritative
     // and its mapped Frontier replaces `committed_frontier`.
     //
@@ -409,6 +427,14 @@ fn reconcile_recovered(
         );
     }
 
+    // Re-apply the boundary the rebuild dropped (see capture above). In-memory
+    // only — the `BB:`/`BC:` keys survive the reconcile below — but this frontier
+    // feeds the committed ∪ hinted union that seeds the leader's cumulative maps.
+    if committed_frontier_rebuilt {
+        committed_frontier.latest_backfill_begin = recovered_backfill_begin;
+        committed_frontier.latest_backfill_complete = recovered_backfill_complete;
+    }
+
     // Reconcile RocksDB now that the final status of the recovered V1 and
     // connector checkpoints is known. If `committed_frontier_rebuilt`, then
     // `committed_frontier` is not natively represented in RocksDB and must be
@@ -434,11 +460,35 @@ fn reconcile_recovered(
         }
     });
 
+    // Markers the hinted transaction adds over committed — the delta the replay
+    // re-notifies (not the whole cumulative, which would re-notify every backfill).
+    let delta_begin = backfill_delta(
+        &hinted_frontier.latest_backfill_begin,
+        &committed_frontier.latest_backfill_begin,
+    );
+    let delta_complete = backfill_delta(
+        &hinted_frontier.latest_backfill_complete,
+        &committed_frontier.latest_backfill_complete,
+    );
+    // Leader's cumulative = committed ∪ hinted, so a hinted marker is present for
+    // prior-gen load classification on every replay Load (peek rounds included).
+    let backfill_begin = backfill_union(
+        committed_frontier.latest_backfill_begin.clone(),
+        &hinted_frontier.latest_backfill_begin,
+    );
+    let backfill_complete = backfill_union(
+        committed_frontier.latest_backfill_complete.clone(),
+        &hinted_frontier.latest_backfill_complete,
+    );
+
     // Compose the session resume Frontier: project the recovered hinted
     // Frontier into hinted form (last_commit -> hinted_commit, zero
-    // last_commit/offset) and reduce with the committed Frontier.
-    let resume_frontier =
+    // last_commit/offset) and reduce with the committed Frontier, then carry
+    // only the marker delta.
+    let mut resume_frontier =
         frontier_mapping::project_hinted(hinted_frontier).reduce(committed_frontier.clone());
+    resume_frontier.latest_backfill_begin = delta_begin;
+    resume_frontier.latest_backfill_complete = delta_complete;
 
     // If we recovered a producer frontier with an unapplied hinted commit,
     // then the first transaction must be an idempotent replay of the hinted frontier.
@@ -451,6 +501,8 @@ fn reconcile_recovered(
         resume_frontier,
         idempotent_replay,
         cleanup_persist,
+        backfill_begin,
+        backfill_complete,
     })
 }
 
@@ -653,6 +705,34 @@ async fn recv_opened(
     .await?;
 
     Ok(openeds.swap_remove(0))
+}
+
+fn backfill_union(
+    mut a: BTreeMap<u16, uuid::Clock>,
+    b: &BTreeMap<u16, uuid::Clock>,
+) -> BTreeMap<u16, uuid::Clock> {
+    for (binding, clock) in b {
+        let entry = a.entry(*binding).or_insert(uuid::Clock::zero());
+        *entry = (*entry).max(*clock);
+    }
+    a
+}
+
+fn backfill_delta(
+    hinted: &BTreeMap<u16, uuid::Clock>,
+    committed: &BTreeMap<u16, uuid::Clock>,
+) -> BTreeMap<u16, uuid::Clock> {
+    hinted
+        .iter()
+        .filter(|(binding, clock)| {
+            **clock
+                > committed
+                    .get(*binding)
+                    .copied()
+                    .unwrap_or(uuid::Clock::zero())
+        })
+        .map(|(binding, clock)| (*binding, *clock))
+        .collect()
 }
 
 #[cfg(test)]

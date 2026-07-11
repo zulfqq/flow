@@ -1,4 +1,4 @@
-use super::{Binding, LoadKeys, drain, scan};
+use super::{Binding, LoadKeys, drain, epochs::Epochs, scan};
 use crate::{patches, proto};
 use anyhow::Context;
 use bytes::Bytes;
@@ -24,6 +24,9 @@ pub(super) enum Phase {
 pub(super) struct Actor {
     // Task binding specifications.
     bindings: Vec<Binding>,
+    // Accumulator-local backfill-truncation epoch state. Both the scanner
+    // and asynchronous Loaded handling classify documents against it.
+    epochs: Epochs,
     // FIFO of outbound connector requests, drained head-first into
     // `connector_tx` as channel capacity permits.
     connector_pending: Vec<materialize::Request>,
@@ -82,8 +85,10 @@ impl Actor {
             tokio::time::Instant::now() + delay
         });
 
+        let l = bindings.len();
         Self {
             bindings,
+            epochs: Epochs::new(l),
             connector_pending: Vec::new(),
             connector_tx,
             db: Some((db, binding_state_keys)),
@@ -151,6 +156,7 @@ impl Actor {
             } else if let Phase::Scanning(mut scanner) = phase {
                 if scanner.step(
                     &self.bindings,
+                    &self.epochs,
                     &mut self.load_keys,
                     &mut self.max_keys,
                     self.disable_load_optimization,
@@ -361,6 +367,10 @@ impl Actor {
             let frontier =
                 shuffle::Frontier::decode(proto).context("invalid Frontier on L:Load")?;
 
+            for (binding, clock) in &frontier.latest_backfill_begin {
+                self.epochs.observe_begin(*binding as usize, *clock);
+            }
+
             let Phase::Idle {
                 accumulator,
                 shuffle_reader,
@@ -375,11 +385,18 @@ impl Actor {
             return Ok((Phase::Scanning(scanner), false));
         } else if let Some(proto::materialize::Flush {
             connector_patches_json,
+            backfill_begins,
+            backfill_completes,
         }) = msg.flush
         {
+            // Forward the markers; the connector self-selects whether to act,
+            // per its key range.
             self.connector_pending.push(materialize::Request {
                 flush: Some(materialize::request::Flush {
                     state_patches_json: connector_patches_json,
+                    backfill_begins: Self::project_backfill_begins(backfill_begins),
+                    backfill_completes: Self::project_backfill_completes(backfill_completes),
+                    ..Default::default()
                 }),
                 ..Default::default()
             });
@@ -405,7 +422,12 @@ impl Actor {
                 }
             }
 
-            let drainer = drain::Drainer::new(accumulator, shuffle_reader, shuffle_remainders)?;
+            let drainer = drain::Drainer::new(
+                accumulator,
+                shuffle_reader,
+                shuffle_remainders,
+                self.epochs.active_epochs(),
+            )?;
             return Ok((Phase::Draining(drainer), false));
         } else if let Some(proto::materialize::StartCommit {
             connector_checkpoint,
@@ -451,6 +473,36 @@ impl Actor {
         Ok((phase, false))
     }
 
+    /// Project the leader's forwarded begin markers into connector-facing
+    /// notifications, converting each clock — the truncation boundary — to a
+    /// wall-clock Timestamp.
+    fn project_backfill_begins(
+        events: Vec<proto::materialize::flush::BackfillBegin>,
+    ) -> Vec<materialize::request::flush::BackfillBegin> {
+        events
+            .into_iter()
+            .map(|e| materialize::request::flush::BackfillBegin {
+                binding: e.binding,
+                timestamp: proto_gazette::uuid::Clock::from_u64(e.clock).to_pb_json_timestamp(),
+            })
+            .collect()
+    }
+
+    /// Project the leader's forwarded complete markers into connector-facing
+    /// notifications. See [`Self::project_backfill_begins`]; the clock is the
+    /// completed backfill's begin (truncation) boundary.
+    fn project_backfill_completes(
+        events: Vec<proto::materialize::flush::BackfillComplete>,
+    ) -> Vec<materialize::request::flush::BackfillComplete> {
+        events
+            .into_iter()
+            .map(|e| materialize::request::flush::BackfillComplete {
+                binding: e.binding,
+                timestamp: proto_gazette::uuid::Clock::from_u64(e.clock).to_pb_json_timestamp(),
+            })
+            .collect()
+    }
+
     fn on_connector_response(
         &mut self,
         phase: &mut Phase,
@@ -492,16 +544,38 @@ impl Actor {
                 }
             };
             let binding_index = binding as usize;
-            let binding_spec = self
-                .bindings
-                .get(binding_index)
-                .ok_or_else(|| anyhow::anyhow!("Loaded binding {binding_index} out of range"))?;
+            let binding_spec = &self.bindings[binding_index];
 
             let (memtable, _alloc, doc) =
                 accumulator.parse_json_doc(&doc_json).with_context(|| {
                     format!("parsing loaded doc for {}", binding_spec.collection_name)
                 })?;
-            memtable.add(binding_index as u16, doc, true)?;
+
+            // Classify by the loaded document's UUID clock. As a fall-back for
+            // pre-existing "no flow document" materializations that may not
+            // have the clock available, this is not strictly required unless
+            // backfill boundaries are present in the source.
+            let epoch = if !self.epochs.has_boundary(binding_index) {
+                0
+            } else if let Some(doc::HeapNode::String(uuid)) =
+                binding_spec.document_uuid_ptr.query(&doc)
+            {
+                let (_, clock, _) = proto_gazette::uuid::parse_str(uuid).with_context(|| {
+                    format!(
+                        "loaded doc for {} has an unparseable document UUID {uuid:?}",
+                        binding_spec.collection_name,
+                    )
+                })?;
+                self.epochs.epoch_for_clock(binding_index, clock)
+            } else {
+                anyhow::bail!(
+                    "loaded doc for {} is being backfill-truncated but has no document UUID \
+                     at _meta/uuid; the materialization must store the root document \
+                     (flow_document) or reconstruct _meta/uuid",
+                    binding_spec.collection_name,
+                );
+            };
+            memtable.add(binding_index as u16, doc, true, epoch)?;
         } else if let Some(materialize::response::Flushed { state }) = resp.flushed {
             let bindings = std::mem::take(&mut self.flushed).into_values().collect();
             _ = self.leader_tx.send(proto::Materialize {
@@ -603,6 +677,7 @@ mod tests {
         (
             Actor {
                 bindings: Vec::new(),
+                epochs: Epochs::new(0),
                 connector_pending: Vec::new(),
                 connector_tx,
                 db: None,
@@ -701,6 +776,7 @@ mod tests {
 
         let actor = Actor {
             bindings: Vec::new(),
+            epochs: Epochs::new(0),
             connector_pending: Vec::new(),
             connector_tx: actor_to_conn_tx,
             db: Some((db, Vec::new())),
@@ -772,6 +848,7 @@ mod tests {
             .send(Ok(proto::Materialize {
                 flush: Some(proto::materialize::Flush {
                     connector_patches_json: Bytes::from_static(br#"[{"f":1}]"#),
+                    ..Default::default()
                 }),
                 ..Default::default()
             }))
@@ -893,5 +970,207 @@ mod tests {
         // Confirm the Persist round-tripped: scan back the last_applied bytes.
         let (_db, recover) = db.scan(Vec::new()).await.unwrap();
         assert_eq!(recover.last_applied.as_ref(), b"persisted-spec-bytes");
+    }
+
+    // A full-reduction binding storing the root document, keyed on /key, whose
+    // `v` array reduces by append. `document_uuid_ptr` lets the shard read each
+    // loaded row's UUID to classify it against the backfill boundary.
+    fn backfill_binding() -> Binding {
+        Binding {
+            collection_name: "test/collection".to_string(),
+            delta_updates: false,
+            document_uuid_ptr: json::Pointer::from("/_meta/uuid"),
+            key_extractors: vec![doc::Extractor::with_default(
+                "/key",
+                &doc::SerPolicy::noop(),
+                serde_json::json!(""),
+            )],
+            read_schema_json: bytes::Bytes::from_static(
+                br#"{
+                    "type": "object",
+                    "properties": {
+                        "key": { "type": "string" },
+                        "v": { "type": "array", "reduce": { "strategy": "append" } }
+                    },
+                    "reduce": { "strategy": "merge" }
+                }"#,
+            ),
+            ser_policy: doc::SerPolicy::noop(),
+            state_key: "test/collection".to_string(),
+            store_document: true,
+            value_plan: doc::ExtractorPlan::new(&[]),
+        }
+    }
+
+    #[tokio::test]
+    async fn backfill_load_classifies_loaded_docs_through_drain() {
+        let producer = proto_gazette::uuid::Producer::from_bytes([0x01, 0, 0, 0, 0, 0]);
+        let flags = proto_gazette::uuid::Flags(0);
+        let mk_uuid = |clock| proto_gazette::uuid::build(producer, clock, flags).to_string();
+        // The boundary, plus a row clock below it (stale) and above it (fresh).
+        let truncated_at = proto_gazette::uuid::Clock::from_unix(1_700_000_000, 0);
+        let stale = mk_uuid(proto_gazette::uuid::Clock::from_unix(1_699_999_999, 0));
+        let fresh = mk_uuid(proto_gazette::uuid::Clock::from_unix(1_700_000_001, 0));
+
+        let (mut actor, _leader_rx, _connector_rx) = make_actor();
+        actor.bindings = vec![backfill_binding()];
+        actor.epochs = Epochs::new(1);
+
+        let accumulator = crate::Accumulator::new(
+            super::super::task::combine_spec(&[backfill_binding()]).unwrap(),
+        )
+        .unwrap();
+        let shuffle_dir = tempfile::tempdir().unwrap();
+        let shuffle_reader = shuffle::log::Reader::new(shuffle_dir.path(), 0);
+        let idle = Phase::Idle {
+            accumulator,
+            shuffle_reader,
+            shuffle_remainders: VecDeque::new(),
+        };
+
+        // L:Load — the Frontier carries the binding's `truncated_at`, which the
+        // handler applies to epoch state as a boundary before the scan.
+        let mut frontier = shuffle::Frontier::new(Vec::new(), vec![0u64]).unwrap();
+        frontier.latest_backfill_begin.insert(0, truncated_at);
+
+        let (mut phase, _stop) = actor
+            .on_leader_message(
+                idle,
+                Some(Ok(proto::Materialize {
+                    load: Some(proto::materialize::Load {
+                        frontier: Some(frontier.encode()),
+                    }),
+                    ..Default::default()
+                })),
+            )
+            .unwrap();
+
+        // The boundary is applied to epoch state: clocks below it are epoch 0
+        // (stale); at or above, the active epoch is the boundary clock itself.
+        assert_eq!(
+            actor.epochs.epoch_for_clock(0, truncated_at),
+            truncated_at.as_u64()
+        );
+        assert_eq!(
+            actor
+                .epochs
+                .epoch_for_clock(0, proto_gazette::uuid::Clock::from_unix(1_699_999_999, 0),),
+            0,
+        );
+        assert!(
+            matches!(phase, Phase::Scanning(_)),
+            "L:Load enters the scan"
+        );
+
+        // Three C:Loaded rows, classified against the boundary as they arrive.
+        let loaded = |key: &str, v: &str, uuid: Option<&str>| {
+            let doc = match uuid {
+                Some(u) => serde_json::json!({"key": key, "v": [v], "_meta": {"uuid": u}}),
+                None => serde_json::json!({"key": key, "v": [v]}),
+            };
+            materialize::Response {
+                loaded: Some(materialize::response::Loaded {
+                    binding: 0,
+                    doc_json: Bytes::from(serde_json::to_vec(&doc).unwrap()),
+                }),
+                ..Default::default()
+            }
+        };
+        for resp in [
+            loaded("straddle", "stale", Some(&stale)), // older than the boundary
+            loaded("normal", "loaded", Some(&fresh)),  // newer than the boundary
+        ] {
+            actor
+                .on_connector_response(&mut phase, Some(Ok(resp)))
+                .unwrap();
+        }
+
+        // Inject the current-epoch source documents the scan would surface,
+        // pairing one against each loaded row. The scanner would classify each by
+        // its shuffle clock; here we classify explicitly against the boundary.
+        let fresh_clock = proto_gazette::uuid::Clock::from_unix(1_700_000_001, 0);
+        let Phase::Scanning(mut scanner) = phase else {
+            panic!("expected Scanning phase after L:Load");
+        };
+        {
+            let memtable = scanner.accumulator().memtable().unwrap();
+            for (key, v) in [("straddle", "fresh"), ("normal", "src")] {
+                let epoch = actor.epochs.epoch_for_clock(0, fresh_clock);
+                let doc = serde_json::json!({"key": key, "v": [v]});
+                let node = doc::HeapNode::from_node(&doc, memtable.alloc());
+                memtable.add(0, node, false, epoch).unwrap();
+            }
+        }
+
+        // Drain against each binding's active epoch and collect each stored
+        // (key, v, exists).
+        let active_epochs = actor.epochs.active_epochs();
+        let (accumulator, shuffle_reader, shuffle_remainders, _active) = scanner.into_parts();
+        let mut drainer = drain::Drainer::new(
+            accumulator,
+            shuffle_reader,
+            shuffle_remainders,
+            active_epochs,
+        )
+        .unwrap();
+
+        let mut stores = Vec::new();
+        while let Some(req) = drainer
+            .step(&actor.bindings, connector_init::Codec::Json)
+            .unwrap()
+        {
+            let store = req.store.expect("drained request is a Store");
+            let doc: serde_json::Value = serde_json::from_slice(&store.doc_json).unwrap();
+            stores.push((
+                doc.get("key").and_then(|k| k.as_str()).unwrap().to_string(),
+                doc.get("v").cloned().unwrap(),
+                store.exists,
+            ));
+        }
+
+        // Drained in key order. "straddle"'s loaded row is stale (epoch 0): its
+        // ["stale"] is dropped (not reduced), and only the active source ["fresh"]
+        // stores, exists=true. "normal" (at/above the boundary) loads normally,
+        // reducing its loaded value forward.
+        assert_eq!(
+            stores,
+            vec![
+                (
+                    "normal".to_string(),
+                    serde_json::json!(["loaded", "src"]),
+                    true
+                ),
+                ("straddle".to_string(), serde_json::json!(["fresh"]), true),
+            ],
+        );
+    }
+
+    #[tokio::test]
+    async fn loaded_doc_with_corrupt_uuid_errors() {
+        let (mut actor, _leader_rx, _connector_rx) = make_actor();
+        actor.bindings = vec![backfill_binding()];
+        actor.epochs = Epochs::new(1);
+        // The binding is truncating, so a loaded row's clock is required.
+        actor
+            .epochs
+            .observe_begin(0, proto_gazette::uuid::Clock::from_u64(10));
+
+        // /_meta/uuid is present and a string, but not a valid v1 UUID.
+        let doc = serde_json::json!({"key": "k", "v": ["x"], "_meta": {"uuid": "not-a-uuid"}});
+        let mut phase = make_idle_phase();
+        let result = actor.on_connector_response(
+            &mut phase,
+            Some(Ok(materialize::Response {
+                loaded: Some(materialize::response::Loaded {
+                    binding: 0,
+                    doc_json: Bytes::from(serde_json::to_vec(&doc).unwrap()),
+                }),
+                ..Default::default()
+            })),
+        );
+        assert!(
+            result.is_err(),
+            "a corrupt document UUID fails a truncating binding's transaction"
+        );
     }
 }

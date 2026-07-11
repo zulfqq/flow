@@ -29,9 +29,10 @@ impl Drainer {
         accumulator: crate::Accumulator,
         shuffle_reader: shuffle::log::Reader,
         shuffle_remainders: VecDeque<shuffle::log::Remainder>,
+        active_epochs: Option<Box<[u64]>>,
     ) -> anyhow::Result<Self> {
         let (drainer, parser) = accumulator
-            .into_drainer()
+            .into_drainer(active_epochs)
             .context("preparing combiner drain")?;
 
         Ok(Self {

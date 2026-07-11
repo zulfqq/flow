@@ -181,6 +181,50 @@ key. An authoritative (unmarked) checkpoint implies no V2 transaction has
 committed, so clearing `FC:` loses no V2 state. The transaction loop then
 only ever writes `FC:` deltas.
 
+## Backfill-truncation epochs (materialize)
+
+When a source collection is backfill-truncated, documents a materialization
+sourced before the truncation boundary are superseded and must not combine
+with — or reduce forward into — documents at or above it. The shard actor
+(`shard/materialize/epochs.rs`) tracks per-binding the latest observed
+truncation boundary (`Begin`) clock. Each source document is classified by its
+shuffle clock and each Loaded row by its document UUID clock: a clock at or
+above the boundary takes that **boundary clock as its epoch**, and below it is
+epoch 0 (stale). The combiner (`doc::combine`) partitions reduction by
+`(binding, key, epoch)` and, at drain, emits only each binding's **active**
+(latest-boundary) epoch. A stale entry's content is dropped; only its `front()`
+existence transfers onto the same-key active entry, so a truncated row's
+destination presence is preserved while its value is not. Because the epoch is
+the boundary clock itself, there is no accumulator-local ordinal to renumber
+across transactions — any number of `Begin`/`Complete` cycles coalesce within a
+transaction, and the combiner tag is globally meaningful.
+
+Consequences and requirements:
+
+- **Once a binding has observed a `Begin`, its Loaded rows must expose a
+  parseable document UUID** (at the binding's configured pointer, typically
+  `/_meta/uuid`) so each row can be classified against the boundary; a missing
+  or malformed UUID then fails the transaction. A binding that has never
+  truncated has no boundary, so its Loaded rows are the active epoch
+  regardless of clock and need no UUID — this spares the many pre-existing
+  materializations, unrelated to truncation, whose rows carry none. Delta-update
+  bindings never load and are unaffected.
+- **Boundaries must be visible before the documents they fence.** A `Begin`
+  rides eagerly on unresolved shuffle peeks (see `crates/shuffle`), so the shard
+  applies it before scanning any document at or above its clock, and each
+  document then classifies against the current boundary. This assumes a single
+  writer per truncating collection; concurrent writers are undefined.
+- **Markers are latest-state, not an event log.** The leader keeps
+  session-cumulative per-binding `Begin`/`Complete` maps; each connector
+  `Flush` projects the transaction's latest observed clocks. An eager
+  (unresolved-peek) `Begin` is used only to stamp outgoing `Load` frontiers
+  for shard classification — it never enters transaction extents, the
+  connector `Flush`, or durable `Persist` state until its causal hints
+  resolve and it rides a fully-resolved frontier.
+- **No persisted epoch state.** The per-binding boundary is held only within one
+  accumulator lifetime. On recovery the shard reconstructs it from the leader's
+  cumulative `Begin` (committed ∪ hinted) delivered on the first `L:Load`.
+
 ## Status
 
 - `leader::materialize` / `shard::materialize` and `leader::derive` /

@@ -1,8 +1,9 @@
-use super::{Binding, LoadKeys};
+use super::{Binding, LoadKeys, epochs::Epochs};
 use anyhow::Context;
 use bytes::Buf;
 use bytes::{BufMut, Bytes};
 use proto_flow::materialize;
+use proto_gazette::uuid;
 use std::collections::{HashMap, VecDeque};
 
 use crate::proto::materialize::loaded::Binding as LoadedBinding;
@@ -49,6 +50,7 @@ impl Scanner {
     pub fn step(
         &mut self,
         bindings: &[Binding],
+        epochs: &Epochs,
         load_keys: &mut LoadKeys,
         max_keys: &mut [(Bytes, Bytes)],
         disable_load_optimization: bool,
@@ -80,9 +82,12 @@ impl Scanner {
             let known_valid = meta.flags.to_native() & shuffle::FLAGS_SCHEMA_VALID != 0;
 
             let binding_index = meta.binding.to_native() as u32;
-            let binding = bindings
-                .get(meta.binding.to_native() as usize)
-                .context("scan entry has invalid meta.binding")?;
+            let binding = &bindings[meta.binding.to_native() as usize];
+
+            let epoch = epochs.epoch_for_clock(
+                binding_index as usize,
+                uuid::Clock::from_u64(meta.clock.to_native()),
+            );
 
             memtable
                 .add_embedded(
@@ -91,6 +96,7 @@ impl Scanner {
                     doc.doc.to_heap(alloc),
                     false,
                     known_valid,
+                    epoch,
                 )
                 .context("MemTable::add_embedded failed")?;
 
