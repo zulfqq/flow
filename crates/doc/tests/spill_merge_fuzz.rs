@@ -94,7 +94,7 @@ fn add_as_embedded(
     packed_prefix[..copy_len].copy_from_slice(&scratch[..copy_len]);
 
     memtable
-        .add_embedded(binding, &packed_prefix, embedded, front, false)
+        .add_embedded(binding, &packed_prefix, embedded, front, false, 0)
         .unwrap();
 }
 
@@ -171,18 +171,20 @@ fn run_sequence(seq: Vec<(u8, u8, bool, bool)>) -> Result<(), FuzzError> {
             add_as_embedded(&memtable_mem, binding, &doc_mem, is_reduce, &key);
             add_as_embedded(&memtable_spill, binding, &doc_spill, is_reduce, &key);
         } else {
-            memtable_mem.add(binding, doc_mem, is_reduce).unwrap();
-            memtable_spill.add(binding, doc_spill, is_reduce).unwrap();
+            memtable_mem.add(binding, doc_mem, is_reduce, 0).unwrap();
+            memtable_spill
+                .add(binding, doc_spill, is_reduce, 0)
+                .unwrap();
         }
     }
 
     // Drain memtable_mem directly via MemDrainer (no spill).
-    let mut mem_drainer = memtable_mem.try_into_drainer()?;
+    let mut mem_drainer = memtable_mem.try_into_drainer(None)?;
 
     // Spill the final memtable_spill and drain via SpillDrainer.
     let spec = memtable_spill.spill(&mut spill, chunk_target).unwrap();
     let (spill, ranges) = spill.into_parts();
-    let mut spill_drainer = combine::SpillDrainer::new(spec, spill, &ranges)?;
+    let mut spill_drainer = combine::SpillDrainer::new(spec, spill, &ranges, None)?;
 
     let mut expect_it = expect_full.into_iter();
 

@@ -169,10 +169,15 @@ impl Accumulator {
         Ok((memtable, alloc, self.1.parse_one(doc_bytes, alloc)?))
     }
 
+    /// Drain the combiner. `active_epochs`, when `Some`, is indexed by binding
+    /// and fences backfill-truncation epochs: only each binding's active epoch
+    /// is emitted, dropping stale entries. `None` treats every entry as epoch
+    /// zero and emits them all.
     pub fn into_drainer(
         self,
+        active_epochs: Option<Box<[u64]>>,
     ) -> Result<(doc::combine::Drainer, simd_doc::Parser), doc::combine::Error> {
-        Ok((self.0.into_drainer()?, self.1))
+        Ok((self.0.into_drainer(active_epochs)?, self.1))
     }
 
     pub fn from_drainer(

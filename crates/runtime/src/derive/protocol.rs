@@ -206,7 +206,7 @@ pub fn recv_connector_published_or_flushed(
             anyhow::bail!("unable to create document UUID placeholder");
         };
     }
-    memtable.add(0, doc, false)?;
+    memtable.add(0, doc, false, 0)?;
 
     txn.publish_stats.docs_total += 1;
     txn.publish_stats.bytes_total += doc_json.len() as u64;

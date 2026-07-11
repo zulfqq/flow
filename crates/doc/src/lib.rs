@@ -208,10 +208,11 @@ mod test {
         {
             use crate::combine;
 
-            // Meta holds binding, flags, and partial order-preserving key encoding.
-            assert_eq!(std::mem::size_of::<combine::Meta>(), 16);
-            // HeapEntry is a Node + Meta. Two entries exactly fit within a cache line.
-            assert_eq!(std::mem::size_of::<combine::HeapEntry<'static>>(), 32);
+            // Meta holds binding, flags, an order-preserving key prefix, and a
+            // u64 epoch.
+            assert_eq!(std::mem::size_of::<combine::Meta>(), 24);
+            // HeapEntry is a Node + Meta.
+            assert_eq!(std::mem::size_of::<combine::HeapEntry<'static>>(), 40);
             assert_eq!(std::mem::align_of::<combine::HeapEntry<'static>>(), 8);
         }
     }

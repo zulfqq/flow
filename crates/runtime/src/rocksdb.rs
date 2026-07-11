@@ -495,7 +495,7 @@ fn do_merge_bounded(
             memtable.alloc(),
             [doc::HeapNode::String(key), op].into_iter(),
         );
-        memtable.add(0, doc, false)?;
+        memtable.add(0, doc, false, 0)?;
         consumed += 1;
 
         let bytes_used = memtable
@@ -509,7 +509,7 @@ fn do_merge_bounded(
     }
 
     let mut out = Vec::new();
-    for (index, drained) in memtable.try_into_drainer()?.enumerate() {
+    for (index, drained) in memtable.try_into_drainer(None)?.enumerate() {
         let doc::combine::DrainedDoc { meta: _, root } = drained?;
         let doc::OwnedNode::Heap(root) = root else {
             unreachable!()

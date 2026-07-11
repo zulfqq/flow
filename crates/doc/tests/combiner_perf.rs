@@ -159,14 +159,14 @@ pub fn combiner_perf() {
         )
         .unwrap();
 
-        memtable.add(0, doc, false).unwrap();
+        memtable.add(0, doc, false, 0).unwrap();
     }
 
     let peak_stats = allocator::current_mem_stats();
     let mut drained: usize = 0;
     let mut shape = doc::Shape::nothing();
 
-    for drained_doc in accum.into_drainer().unwrap() {
+    for drained_doc in accum.into_drainer(None).unwrap() {
         let drained_doc = drained_doc.unwrap();
         drained += 1;
         shape.widen_owned(&drained_doc.root);
@@ -297,7 +297,7 @@ pub fn combiner_perf_history_mode() {
         )
         .unwrap();
 
-        memtable.add(0, doc, false).unwrap();
+        memtable.add(0, doc, false, 0).unwrap();
         last_alloc_bytes = memtable.alloc().allocated_bytes();
         document_id += 1;
     }
@@ -307,7 +307,7 @@ pub fn combiner_perf_history_mode() {
 
     eprintln!("Draining {} segments...", segment_count);
 
-    for drained_doc in accum.into_drainer().unwrap() {
+    for drained_doc in accum.into_drainer(None).unwrap() {
         let drained_doc = drained_doc.unwrap();
         drained += 1;
         shape.widen_owned(&drained_doc.root);

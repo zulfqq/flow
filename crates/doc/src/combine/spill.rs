@@ -1,4 +1,6 @@
-use super::{BUMP_THRESHOLD, DrainedDoc, Error, HeapEntry, Meta, Spec, bump_mem_used, reduce};
+use super::{
+    BUMP_THRESHOLD, DrainedDoc, Error, HeapEntry, Meta, Spec, active_epoch, bump_mem_used, reduce,
+};
 use crate::owned::OwnedArchivedNode;
 use crate::{
     Extractor, HeapNode, HeapRoot, LazyNode, OwnedHeapRoot, OwnedNode, redact, validation,
@@ -60,13 +62,16 @@ impl<F: io::Read + io::Write + io::Seek> SpillWriter<F> {
             // serializing into `raw_buf` and re-using its storage each
             // iteration to avoid extra allocation.
 
-            // Write entry header (24 bytes):
+            // Write entry header (32 bytes):
             // - 15 bytes of packed binding index and key prefix
-            // - 4 bytes of padding for alignment
+            // - 8 bytes of little-endian epoch
             // - 1 byte of entry flags
+            // - 4 bytes padding, keeping the header a multiple of 8 so the
+            //   ArchivedNode document that follows is 8-byte aligned
             // - 4 bytes of little-endian document length (excluding header).
             raw_buf.extend_from_slice(&meta.0);
-            raw_buf.extend_from_slice(&[0, 0, 0, 0, meta.1, 0, 0, 0, 0]);
+            raw_buf.extend_from_slice(&meta.2.to_le_bytes());
+            raw_buf.extend_from_slice(&[meta.1, 0, 0, 0, 0, 0, 0, 0, 0]);
 
             match root.access() {
                 Ok(root) => {
@@ -168,8 +173,12 @@ impl Entry {
         }
 
         // Parse entry header.
-        let meta = Meta(chunk[0..15].try_into().unwrap(), chunk[19]);
-        let doc_len = u32::from_le_bytes(chunk[20..ENTRY_HEADER_LEN].try_into().unwrap()) as usize;
+        let meta = Meta(
+            chunk[0..15].try_into().unwrap(),
+            chunk[23],
+            u64::from_le_bytes(chunk[15..23].try_into().unwrap()),
+        );
+        let doc_len = u32::from_le_bytes(chunk[28..ENTRY_HEADER_LEN].try_into().unwrap()) as usize;
         chunk.advance(ENTRY_HEADER_LEN); // Consume header.
 
         if chunk.len() < doc_len {
@@ -297,10 +306,11 @@ impl Ord for Segment {
     fn cmp(&self, other: &Self) -> cmp::Ordering {
         let (l, r) = (&self.head, &other.head);
 
-        // Order entries on (binding, key, !front, spill-order):
-        // For each (binding, key), we take front() entries first, and then
-        // take the Segment which was produced into the spill file first.
-        // This maintains the left-to-right associative ordering of reductions.
+        // Order entries on (binding, key, epoch, !front, spill-order):
+        // For each (binding, key, epoch), we take front() entries first,
+        // and then take the Segment which was produced into the spill file
+        // first. This maintains the left-to-right associative ordering of
+        // reductions.
         //
         // `meta` contains a packed structure that's order-preserving over
         // (binding, key), so we first test it for inequality.
@@ -309,6 +319,7 @@ impl Ord for Segment {
             .then_with(|| {
                 Extractor::compare_key(&self.keys[l.meta.binding()], l.root.get(), r.root.get())
             })
+            .then_with(|| l.meta.epoch().cmp(&r.meta.epoch()))
             .then_with(|| l.meta.front().cmp(&r.meta.front()).reverse())
             .then_with(|| self.next.start.cmp(&other.next.start))
     }
@@ -328,6 +339,9 @@ impl Eq for Segment {}
 /// SpillDrainer drains documents across all segments of a spill file,
 /// yielding drained entries (one per binding & key) in ascending order.
 pub struct SpillDrainer<F: io::Read + io::Seek> {
+    // Active epoch per binding; `None` (or a binding beyond the slice) is
+    // the epoch-zero default.
+    active_epochs: Option<Box<[u64]>>,
     alloc: Arc<Bump>, // Used for individual key reductions.
     heap: BinaryHeap<cmp::Reverse<Segment>>,
     in_group: bool,
@@ -351,7 +365,52 @@ impl<F: io::Read + io::Seek> SpillDrainer<F> {
             self.heap.push(cmp::Reverse(segment));
         }
 
-        let Entry { mut meta, root } = entry;
+        let Entry { mut meta, mut root } = entry;
+
+        // Advance past stale entries (below their binding's active epoch) to
+        // the first active entry. Stale content is superseded — never validated
+        // or reduced — but its front() existence ORs onto the same-(binding, key)
+        // active entry. A stale run with no active entry emits nothing.
+        let mut active = active_epoch(self.active_epochs.as_deref(), meta.binding());
+        let mut stale_front = false;
+        loop {
+            if meta.epoch() == active {
+                break; // (meta, root) is the first active-epoch entry of its key.
+            }
+            stale_front |= meta.front();
+
+            let Some(cmp::Reverse(segment)) = self.heap.pop() else {
+                return Ok(None); // Trailing stale run: nothing to emit.
+            };
+            let (next, segment) = segment.pop_head(&mut self.spill)?;
+            if let Some(segment) = segment {
+                self.heap.push(cmp::Reverse(segment));
+            }
+
+            // Does `next` share (binding, key) with the stale entry being discarded?
+            let same_key = meta.0 == next.meta.0
+                && Extractor::compare_key(
+                    &self.spec.keys[meta.binding()],
+                    root.get(),
+                    next.root.get(),
+                )
+                .is_eq();
+
+            Entry { meta, root } = next;
+            self.in_group = false;
+
+            if !same_key {
+                // The stale run was orphaned: drop its existence evidence, and
+                // re-classify `next`, which may belong to a different binding.
+                stale_front = false;
+                active = active_epoch(self.active_epochs.as_deref(), meta.binding());
+            }
+        }
+
+        if stale_front {
+            meta.set_front(); // Transfer stale existence onto the active output.
+        }
+
         let is_full = self.spec.is_full[meta.binding()];
         let key = self.spec.keys[meta.binding()].as_ref();
         let validator = &mut self.spec.validators[meta.binding()];
@@ -478,8 +537,14 @@ impl<F: io::Read + io::Seek> Iterator for SpillDrainer<F> {
 
 impl<F: io::Read + io::Seek> SpillDrainer<F> {
     /// Build a new SpillDrainer which drains the given segment ranges previously
-    /// written to the spill file.
-    pub fn new(spec: Spec, mut spill: F, ranges: &[Range<u64>]) -> Result<Self, std::io::Error> {
+    /// written to the spill file. `active_epochs` is as for
+    /// [`super::Accumulator::into_drainer`].
+    pub fn new(
+        spec: Spec,
+        mut spill: F,
+        ranges: &[Range<u64>],
+        active_epochs: Option<Box<[u64]>>,
+    ) -> Result<Self, std::io::Error> {
         let mut heap = BinaryHeap::with_capacity(ranges.len());
 
         for range in ranges {
@@ -488,6 +553,7 @@ impl<F: io::Read + io::Seek> SpillDrainer<F> {
         }
 
         Ok(Self {
+            active_epochs,
             alloc: Arc::new(Bump::new()),
             heap,
             in_group: false,
@@ -498,6 +564,7 @@ impl<F: io::Read + io::Seek> SpillDrainer<F> {
 
     pub fn into_parts(self) -> (Spec, F) {
         let Self {
+            active_epochs: _,
             alloc: _,
             heap: _,
             in_group: _,
@@ -536,22 +603,22 @@ mod test {
         let (mut spill, ranges) = spill.into_parts();
 
         // Assert we wrote the expected range and regression fixture.
-        assert_eq!(ranges, vec![0..179]);
+        assert_eq!(ranges, vec![0..188]);
 
         insta::assert_snapshot!(to_hex(&spill.get_ref()), @"
-        |62000000 b0000000 1e000100 90084000| b.............@. 00000000
-        |00006b65 79ff0100 70080000 00616161| ..key...p....aaa 00000010
-        |0b0010ff 2b001176 0a000318 00437070| ....+..v.....Cpp 00000020
-        |6c651800 d0060000 00030000 00c8ffff| le.............. 00000030
-        |ff022900 10010500 0902001c 01580030| ..)..........X.0 00000040
-        |6262624b 000d5800 6262616e 616e6118| bbbK..X.bbanana. 00000050
-        |00075800 50ff0200 00004100 00005800| ..X.P.....A...X. 00000060
-        |00003c00 02000100 90014000 00006b65| ..<.......@...ke 00000070
-        |79ff0100 70080000 00636363 0b0010ff| y...p....ccc.... 00000080
-        |29001176 0a000318 00526172 726f7418| )..v.....Rarrot. 00000090
-        |00f00106 00000003 000000c8 ffffff02| ................ 000000a0
-        |000000|                              ...              000000b0
-                                                               000000b3
+        |67000000 c0000000 1f000100 03100817| g............... 00000000
+        |00804000 00006b65 79ff0100 00110030| ..@...key......0 00000010
+        |6161610b 0010ff1c 0011760a 00031800| aaa.......v..... 00000020
+        |4370706c 651800d0 06000000 03000000| Cpple........... 00000030
+        |c8ffffff 02290010 0105000d 02000116| .....).......... 00000040
+        |000c6000 30626262 53000d60 00626261| ..`.0bbbS..`.bba 00000050
+        |6e616e61 18000760 0050ff02 00000045| nana...`.P.....E 00000060
+        |00000060 0000003f 00020001 00011001| ...`...?........ 00000070
+        |15008040 0000006b 6579ff01 00700800| ...@...key...p.. 00000080
+        |00006363 630b0010 ff1c0011 760a0003| ..ccc.......v... 00000090
+        |18005261 72726f74 1800f001 06000000| ..Rarrot........ 000000a0
+        |03000000 c8ffffff 02000000|          ............     000000b0
+                                                               000000bc
         ");
 
         // Parse the region as a Segment.
@@ -562,7 +629,7 @@ mod test {
         assert_eq!(segment.head.meta.front(), false);
         assert!(compare(segment.head.root.get(), &fixture[0].1).is_eq());
         assert!(!segment.tail.is_empty());
-        assert_eq!(segment.next, 106..179);
+        assert_eq!(segment.next, 111..188);
 
         let (_, next_segment) = segment.pop_head(&mut spill).unwrap();
         segment = next_segment.unwrap();
@@ -571,7 +638,7 @@ mod test {
         assert_eq!(segment.head.meta.front(), true);
         assert!(compare(segment.head.root.get(), &fixture[1].1).is_eq());
         assert!(segment.tail.is_empty()); // Chunk is empty.
-        assert_eq!(segment.next, 106..179);
+        assert_eq!(segment.next, 111..188);
 
         // Next chunk is read and has one document.
         let (_, next_segment) = segment.pop_head(&mut spill).unwrap();
@@ -581,7 +648,7 @@ mod test {
         assert_eq!(segment.head.meta.front(), true);
         assert!(compare(segment.head.root.get(), &fixture[2].1).is_eq());
         assert!(segment.tail.is_empty()); // Chunk is empty.
-        assert_eq!(segment.next, 179..179);
+        assert_eq!(segment.next, 188..188);
 
         // Stepping the segment again consumes it, as no chunks remain.
         let (_, next_segment) = segment.pop_head(&mut spill).unwrap();
@@ -672,7 +739,7 @@ mod test {
 
         // Map from SpillWriter => SpillDrainer.
         let (spill, ranges) = spill.into_parts();
-        let drainer = SpillDrainer::new(spec, spill, &ranges).unwrap();
+        let drainer = SpillDrainer::new(spec, spill, &ranges, None).unwrap();
 
         let actual = drainer
             .map_ok(|doc| {
@@ -808,7 +875,7 @@ mod test {
             spill.write_segment(&segment, CHUNK_TARGET_SIZE).unwrap();
         }
         let (spill, ranges) = spill.into_parts();
-        let mut drainer = SpillDrainer::new(spec, spill, &ranges).unwrap();
+        let mut drainer = SpillDrainer::new(spec, spill, &ranges, None).unwrap();
 
         // "aaa" is front() & validated, and matches the schema.
         assert!(matches!(
@@ -928,7 +995,7 @@ mod test {
             for &(key, value) in keys {
                 let doc =
                     HeapNode::from_node(&json!({"key": key, "value": value}), memtable.alloc());
-                memtable.add(0, doc, false).unwrap();
+                memtable.add(0, doc, false, 0).unwrap();
             }
 
             let start = spill.spill.seek(io::SeekFrom::Current(0)).unwrap();
@@ -939,7 +1006,7 @@ mod test {
 
         // Read back through SpillDrainer and verify ordering
         let (spill, _) = spill.into_parts();
-        let mut drainer = SpillDrainer::new(spec, spill, &ranges).unwrap();
+        let mut drainer = SpillDrainer::new(spec, spill, &ranges, None).unwrap();
 
         let all_keys: Vec<String> = std::iter::from_fn(|| drainer.next())
             .map(|doc| {
@@ -1018,7 +1085,7 @@ mod test {
         }
 
         let (spill, ranges) = spill.into_parts();
-        let drainer = SpillDrainer::new(spec, spill, &ranges).unwrap();
+        let drainer = SpillDrainer::new(spec, spill, &ranges, None).unwrap();
 
         let actual = drainer
             .map_ok(|doc| {
@@ -1078,11 +1145,112 @@ mod test {
         "###);
     }
 
+    #[test]
+    fn test_epoch_spill_header_roundtrip() {
+        // An epoch using its full width must survive the 28-byte entry header
+        // (encoded as a u64 LE).
+        let alloc = Bump::new();
+        let entries = vec![HeapEntry {
+            meta: Meta::new(0, &[], false, true, 0x0807060504030201),
+            root: HeapRoot::from_heap_node(HeapNode::from_node(&json!({"key": "k"}), &alloc)),
+        }];
+
+        let mut spill = SpillWriter::new(io::Cursor::new(Vec::new())).unwrap();
+        spill.write_segment(&entries, CHUNK_TARGET_SIZE).unwrap();
+        let (mut spill, ranges) = spill.into_parts();
+
+        let keys: Arc<[Box<[Extractor]>]> = Vec::new().into();
+        let segment = Segment::new(keys, &mut spill, ranges[0].clone()).unwrap();
+        assert_eq!(segment.head.meta.epoch(), 0x0807060504030201);
+        assert_eq!(segment.head.meta.binding(), 0);
+        assert!(segment.head.meta.known_valid());
+    }
+
+    #[test]
+    fn test_epoch_cross_segment() {
+        // Stale and active entries of one key, split across two spill segments,
+        // still partition on drain; a stale-only key emits nothing.
+        let schema = json::schema::build(
+            &url::Url::parse("http://example/schema").unwrap(),
+            &json!({
+                "properties": { "v": { "type": "array", "reduce": { "strategy": "append" } } },
+                "reduce": { "strategy": "merge" }
+            }),
+        )
+        .unwrap();
+        let spec = Spec::with_one_binding(
+            true,
+            vec![Extractor::with_default(
+                "/key",
+                &SerPolicy::noop(),
+                json!("def"),
+            )],
+            "source",
+            Vec::new(),
+            Validator::new(schema).unwrap(),
+        );
+
+        let alloc = Bump::new();
+        // Segment 1 holds a stale e0 Loaded for "k" (front) and a stale-only e0
+        // "z"; Segment 2 holds the active e1 source for "k".
+        let fixtures = vec![
+            segment_fixture_epoch(
+                &[
+                    (0, json!({"key": "k", "v": ["stale"]}), true, 0),
+                    (0, json!({"key": "z", "v": ["orphan"]}), true, 0),
+                ],
+                &alloc,
+            ),
+            segment_fixture_epoch(
+                &[(0, json!({"key": "k", "v": ["fresh"]}), false, 1)],
+                &alloc,
+            ),
+        ];
+
+        let mut spill = SpillWriter::new(io::Cursor::new(Vec::new())).unwrap();
+        for segment in fixtures {
+            spill.write_segment(&segment, CHUNK_TARGET_SIZE).unwrap();
+        }
+        let (spill, ranges) = spill.into_parts();
+
+        let drained = SpillDrainer::new(spec, spill, &ranges, Some(Box::new([1])))
+            .unwrap()
+            .map_ok(|doc| {
+                (
+                    serde_json::to_value(SerPolicy::noop().on_owned(&doc.root)).unwrap(),
+                    doc.meta.front(),
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+
+        assert_eq!(
+            drained,
+            vec![(json!({"key": "k", "v": ["fresh"]}), true)],
+            "stale content dropped, existence transferred; orphan 'z' emits nothing",
+        );
+    }
+
     fn to_hex(b: &[u8]) -> String {
         hexdump::hexdump_iter(b)
             .map(|line| format!("{line}"))
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    /// Like `segment_fixture`, but each fixture tuple carries an explicit
+    /// epoch. `!front()` entries are marked known_valid.
+    fn segment_fixture_epoch<'alloc>(
+        fixture: &[(u16, Value, bool, u64)],
+        alloc: &'alloc bumpalo::Bump,
+    ) -> Vec<HeapEntry<'alloc>> {
+        fixture
+            .into_iter()
+            .map(|(binding, value, front, epoch)| HeapEntry {
+                meta: Meta::new(*binding, &[], *front, !front, *epoch),
+                root: HeapRoot::from_heap_node(HeapNode::from_node(value, &alloc)),
+            })
+            .collect()
     }
 
     fn segment_fixture<'alloc>(
@@ -1094,7 +1262,7 @@ mod test {
             .map(|(binding, value, front)| HeapEntry {
                 // !front() entries are marked known_valid, simulating having
                 // been validated during memtable::spill().
-                meta: Meta::new(*binding, &[], *front, !front),
+                meta: Meta::new(*binding, &[], *front, !front, 0),
                 root: HeapRoot::from_heap_node(HeapNode::from_node(value, &alloc)),
             })
             .collect()
@@ -1126,7 +1294,7 @@ mod test {
                 let raw = buf as &[crate::embedded::U64Le];
 
                 HeapEntry {
-                    meta: Meta::new(*binding, &[], *front, !front),
+                    meta: Meta::new(*binding, &[], *front, !front, 0),
                     root: HeapRoot::Embedded(raw.as_ptr(), raw.len() as u32),
                 }
             })
@@ -1148,9 +1316,12 @@ const ENTRY_HEADER_LEN: usize =
     2 +
     // Key tuple prefix, with trailing zero padding.
     13 +
-    // 4 bytes of padding for alignment.
-    4 +
-    // Entry flags
+    // u64_le combiner epoch.
+    8 +
+    // Entry flags.
     1 +
+    // Padding, keeping the header a multiple of 8 so the following ArchivedNode
+    // document is 8-byte aligned.
+    4 +
     // u32_le document length (excluding header).
     4;

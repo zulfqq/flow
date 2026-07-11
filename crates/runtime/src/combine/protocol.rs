@@ -114,7 +114,7 @@ pub fn recv_client_add(
         };
     }
 
-    memtable.add(binding_index as u16, doc, front)?;
+    memtable.add(binding_index as u16, doc, front, 0)?;
 
     Ok(())
 }

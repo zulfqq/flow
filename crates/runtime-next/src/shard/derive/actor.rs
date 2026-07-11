@@ -385,7 +385,9 @@ impl<P: crate::Publisher, L: crate::Logger> Actor<P, L> {
                 .take()
                 .context("L:Store while a drain is still in flight")?;
             let active = std::mem::replace(accumulator, recycled);
-            let (drainer, parser) = active.into_drainer().context("preparing combiner drain")?;
+            let (drainer, parser) = active
+                .into_drainer(None)
+                .context("preparing combiner drain")?;
 
             let publisher = self
                 .publisher
@@ -493,7 +495,7 @@ impl<P: crate::Publisher, L: crate::Logger> Actor<P, L> {
                     anyhow::bail!("unable to create document UUID placeholder");
                 };
             }
-            memtable.add(0, doc, false)?;
+            memtable.add(0, doc, false, 0)?;
 
             self.published_docs += 1;
             self.published_bytes += doc_json.len() as u64;

@@ -1,4 +1,4 @@
-use super::{DrainedDoc, Error, HeapEntry, Meta, Spec, SpillWriter};
+use super::{DrainedDoc, Error, HeapEntry, Meta, Spec, SpillWriter, active_epoch};
 use crate::{
     Encoding, Extractor, HeapEmbedded, HeapNode, HeapRoot, LazyNode, OwnedHeapRoot, OwnedNode,
     redact, reduce, validation,
@@ -66,10 +66,12 @@ impl Entries {
     }
 
     fn compact(&mut self, alloc: &'static Bump) -> Result<(), Error> {
-        // `sort_ord` orders over (binding, key, !front):
-        // For each (binding, key), we take front() entries first, and further
-        // rely on sort preserving the order in which entries were added.
-        // This maintains the left-to-right associative ordering of reductions.
+        // `sort_ord` orders over (binding, key, epoch, !front):
+        // For each (binding, key, epoch), we take front() entries first,
+        // and further rely on sort preserving the order in which entries were
+        // added. This maintains the left-to-right associative ordering of
+        // reductions. Epoch is a group boundary, so compaction reduces only
+        // within one epoch.
         //
         // `meta` contains a packed structure that's order-preserving over
         // (binding, key), so we first test it for inequality.
@@ -80,6 +82,7 @@ impl Entries {
                     // Cold path: Meta prefix was equal, so compare the full key.
                     compare_root_keys(&self.spec.keys[l.meta.binding()], &l.root, &r.root)
                 })
+                .then_with(|| l.meta.epoch().cmp(&r.meta.epoch()))
                 .then_with(|| l.meta.front().cmp(&r.meta.front()).reverse())
         };
         let validators = &mut self.spec.validators;
@@ -232,8 +235,15 @@ impl MemTable {
         &self.zz_alloc
     }
 
-    /// Add the document to the MemTable.
-    pub fn add<'s>(&'s self, binding: u16, root: HeapNode<'s>, front: bool) -> Result<(), Error> {
+    /// Add the document to the MemTable at the given epoch (0 if the caller
+    /// doesn't partition on epochs).
+    pub fn add<'s>(
+        &'s self,
+        binding: u16,
+        root: HeapNode<'s>,
+        front: bool,
+        epoch: u64,
+    ) -> Result<(), Error> {
         // Safety: mutable borrow does not escape this function.
         let entries = unsafe { &mut *self.entries.get() };
         let root = unsafe { std::mem::transmute::<HeapNode<'s>, HeapNode<'static>>(root) };
@@ -250,6 +260,7 @@ impl MemTable {
             &entries.scratch,
             front,
             false, // `known_valid`
+            epoch,
         );
 
         entries.queued.push(HeapEntry {
@@ -274,6 +285,7 @@ impl MemTable {
         embedded: HeapEmbedded<'s>,
         front: bool,
         known_valid: bool,
+        epoch: u64,
     ) -> Result<(), Error> {
         // Safety: mutable borrow does not escape this function.
         let entries = unsafe { &mut *self.entries.get() };
@@ -303,7 +315,7 @@ impl MemTable {
         let raw = embedded.as_u64le_slice();
         let root = HeapRoot::Embedded(raw.as_ptr(), raw.len() as u32);
 
-        let meta = Meta::from_packed_prefix(binding, packed_key_prefix, front, known_valid);
+        let meta = Meta::from_packed_prefix(binding, packed_key_prefix, front, known_valid, epoch);
         entries.queued.push(HeapEntry { meta, root });
 
         if entries.should_compact() {
@@ -335,10 +347,11 @@ impl MemTable {
     }
 
     /// Convert this MemTable into a MemDrainer.
-    pub fn try_into_drainer(self) -> Result<MemDrainer, Error> {
+    pub fn try_into_drainer(self, active_epochs: Option<Box<[u64]>>) -> Result<MemDrainer, Error> {
         let (sorted, spec, zz_alloc) = self.try_into_parts()?;
 
         Ok(MemDrainer {
+            active_epochs,
             in_group: false,
             it: sorted.into_iter().peekable(),
             spec,
@@ -417,6 +430,7 @@ impl MemTable {
 }
 
 pub struct MemDrainer {
+    active_epochs: Option<Box<[u64]>>,
     in_group: bool,
     it: std::iter::Peekable<std::vec::IntoIter<HeapEntry<'static>>>,
     spec: Spec,
@@ -432,6 +446,42 @@ impl MemDrainer {
         let Some(HeapEntry { mut meta, mut root }) = self.it.next() else {
             return Ok(None);
         };
+
+        // Advance past stale entries (below their binding's active epoch) to
+        // the first active entry. Stale content is superseded — never validated
+        // or reduced — but its front() existence ORs onto the same-(binding, key)
+        // active entry. A stale run with no active entry emits nothing.
+        let mut active = active_epoch(self.active_epochs.as_deref(), meta.binding());
+        let mut stale_front = false;
+        loop {
+            if meta.epoch() == active {
+                break; // (meta, root) is the first active-epoch entry of its key.
+            }
+            stale_front |= meta.front();
+
+            let Some(next) = self.it.next() else {
+                return Ok(None); // Trailing stale run: nothing to emit.
+            };
+
+            // Does `next` share (binding, key) with the stale entry being discarded?
+            let same_key = meta.0 == next.meta.0
+                && compare_root_keys(&self.spec.keys[meta.binding()], &root, &next.root).is_eq();
+
+            HeapEntry { meta, root } = next;
+            self.in_group = false;
+
+            if !same_key {
+                // The stale run was orphaned: drop its existence evidence, and
+                // re-classify `next`, which may belong to a different binding.
+                stale_front = false;
+                active = active_epoch(self.active_epochs.as_deref(), meta.binding());
+            }
+        }
+
+        if stale_front {
+            meta.set_front(); // Transfer stale existence onto the active output.
+        }
+
         let is_full = self.spec.is_full[meta.binding()];
         let keys = self.spec.keys[meta.binding()].as_ref();
         let name = &self.spec.names[meta.binding()];
@@ -519,6 +569,7 @@ impl Iterator for MemDrainer {
 impl MemDrainer {
     pub fn into_spec(self) -> Spec {
         let MemDrainer {
+            active_epochs: _,
             in_group: _,
             it,
             spec,
@@ -641,8 +692,128 @@ mod test {
         packed_prefix[..copy_len].copy_from_slice(&scratch[..copy_len]);
 
         memtable
-            .add_embedded(binding, &packed_prefix, embedded, front, false)
+            .add_embedded(binding, &packed_prefix, embedded, front, false, 0)
             .unwrap();
+    }
+
+    #[test]
+    fn test_epoch_partition() {
+        // Stale entries (below their binding's active epoch) are dropped,
+        // their ORed front() transferring onto the same-key active entry; drain
+        // output must match in-memory and via a spill file. Binding 0's active
+        // epoch is e2; binding 1 stays at e0.
+        fn build(memtable: &MemTable) {
+            let add = |binding: u16, key: &str, v: &str, front: bool, epoch: u64| {
+                let doc = json!({ "key": key, "v": [v] });
+                memtable
+                    .add(
+                        binding,
+                        HeapNode::from_node(&doc, memtable.alloc()),
+                        front,
+                        epoch,
+                    )
+                    .unwrap();
+            };
+
+            // "exist_once": stale Loaded existence in e0 and e1 transfers once to the e2 source.
+            add(0, "exist_once", "L0", true, 0);
+            add(0, "exist_once", "L1", true, 1);
+            add(0, "exist_once", "s2", false, 2);
+
+            // "multi": a source in e0/e1/e2; only active e2 stores, and gains no existence.
+            add(0, "multi", "a0", false, 0);
+            add(0, "multi", "a1", false, 1);
+            add(0, "multi", "a2", false, 2);
+
+            // "no_exist": a stale e0 source (front=false) fabricates no existence.
+            add(0, "no_exist", "x0", false, 0);
+            add(0, "no_exist", "x2", false, 2);
+
+            // "orphan": a stale-only key emits nothing and doesn't disturb the next key.
+            add(0, "orphan", "gone", true, 0);
+
+            // "reduce2": a e2 Loaded reduces with a e2 source; the stale e0 source is dropped.
+            add(0, "reduce2", "r0", false, 0);
+            add(0, "reduce2", "r_load", true, 2);
+            add(0, "reduce2", "r_src", false, 2);
+
+            // "zzz_cross": stale-only and the last key of binding 0, so its stale
+            // walk crosses into binding 1 — active must be re-fetched for the new
+            // binding (e2 → e0), and the orphan's front() must not leak across.
+            add(0, "zzz_cross", "gone", true, 0);
+
+            // Binding 1 stays entirely at its active e0: drained normally.
+            add(1, "b", "b0", false, 0);
+        }
+
+        // Two identical full-reduction bindings keyed on /key. A closure (not
+        // `vec![…; 2]`) because `Validator` isn't `Clone`.
+        fn epoch_spec() -> Spec {
+            let binding = || {
+                let schema = build_schema(
+                    &url::Url::parse("http://example/schema").unwrap(),
+                    &json!({
+                        "properties": { "v": { "type": "array", "reduce": { "strategy": "append" } } },
+                        "reduce": { "strategy": "merge" }
+                    }),
+                )
+                .unwrap();
+                (
+                    true, // Full reduction.
+                    vec![Extractor::with_default(
+                        "/key",
+                        &SerPolicy::noop(),
+                        json!("def"),
+                    )],
+                    "test",
+                    Validator::new(schema).unwrap(),
+                )
+            };
+            Spec::with_bindings([binding(), binding()], Vec::new())
+        }
+
+        let make = || {
+            let memtable = MemTable::new(epoch_spec());
+            build(&memtable);
+            memtable
+        };
+        // Active epochs: binding 0 → e2, binding 1 → e0.
+        let epochs = || -> Box<[u64]> { Box::new([2, 0]) };
+
+        fn project(doc: crate::combine::DrainedDoc) -> (usize, serde_json::Value, bool) {
+            (
+                doc.meta.binding(),
+                serde_json::to_value(SerPolicy::noop().on_owned(&doc.root)).unwrap(),
+                doc.meta.front(),
+            )
+        }
+        let expected = vec![
+            (0, json!({"key": "exist_once", "v": ["s2"]}), true),
+            (0, json!({"key": "multi", "v": ["a2"]}), false),
+            (0, json!({"key": "no_exist", "v": ["x2"]}), false),
+            (0, json!({"key": "reduce2", "v": ["r_load", "r_src"]}), true),
+            (1, json!({"key": "b", "v": ["b0"]}), false),
+        ];
+
+        // In-memory drain.
+        let in_memory = make()
+            .try_into_drainer(Some(epochs()))
+            .unwrap()
+            .map_ok(project)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(in_memory, expected, "in-memory drain");
+
+        // Spill drain: same fixture, forced through a spill file.
+        let mut spill = SpillWriter::new(io::Cursor::new(Vec::new())).unwrap();
+        let spec = make().spill(&mut spill, CHUNK_TARGET_SIZE).unwrap();
+        let (spill, ranges) = spill.into_parts();
+        let spilled = crate::combine::SpillDrainer::new(spec, spill, &ranges, Some(epochs()))
+            .unwrap()
+            .map_ok(project)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(spilled, expected, "spill drain");
     }
 
     #[test]
@@ -688,7 +859,7 @@ mod test {
         let add_and_compact = |docs: &[(bool, Value)]| {
             for (front, doc) in docs {
                 let doc_0 = HeapNode::from_node(doc, memtable.alloc());
-                memtable.add(0, doc_0, *front).unwrap();
+                memtable.add(0, doc_0, *front, 0).unwrap();
                 add_as_embedded(&memtable, 1, doc, *front, &key);
             }
             memtable.compact().unwrap();
@@ -723,7 +894,7 @@ mod test {
         ]);
 
         let actual = memtable
-            .try_into_drainer()
+            .try_into_drainer(None)
             .unwrap()
             .map_ok(|doc| {
                 (
@@ -942,9 +1113,9 @@ mod test {
         let add_and_compact = |loaded: bool, docs: Value| {
             for doc in docs.as_array().unwrap() {
                 let d = HeapNode::from_node(doc, memtable.alloc());
-                memtable.add(0, d, loaded).unwrap();
+                memtable.add(0, d, loaded, 0).unwrap();
                 let d = HeapNode::from_node(doc, memtable.alloc());
-                memtable.add(1, d, loaded).unwrap();
+                memtable.add(1, d, loaded, 0).unwrap();
             }
             memtable.compact().unwrap();
         };
@@ -1151,7 +1322,7 @@ mod test {
         //  * front() vs !front() documents, which were also held back
         //    (we only now know that further front() docs cannot arrive).
         let mut drained = String::new();
-        for doc in memtable.try_into_drainer().unwrap() {
+        for doc in memtable.try_into_drainer(None).unwrap() {
             let DrainedDoc { meta, root } = doc.unwrap();
             drained.push_str(&format!(
                 "{meta:?} {}\n",
@@ -1197,7 +1368,7 @@ mod test {
 
         let add = |memtable: &MemTable, front: bool, doc: Value| {
             let doc = HeapNode::from_node(&doc, memtable.alloc());
-            memtable.add(0, doc, front).unwrap();
+            memtable.add(0, doc, front, 0).unwrap();
         };
 
         // While we validate the !front() documents, expect we don't validate front() ones,
@@ -1210,18 +1381,18 @@ mod test {
         let spec = memtable.spill(&mut spill, CHUNK_TARGET_SIZE).unwrap();
 
         let (spill, ranges) = spill.into_parts();
-        assert_eq!(ranges, vec![0..138]);
+        assert_eq!(ranges, vec![0..144]);
         insta::assert_snapshot!(to_hex(spill.get_ref()), @"
-        |82000000 08010000 78000002 61616100| ........x...aaa. 00000000
-        |01009008 40000000 6b6579ff 01007008| ....@...key...p. 00000010
-        |00000061 61610b00 10ff2500 11760a00| ...aaa....%..v.. 00000020
-        |02180040 676f6f64 0c000018 00d00600| ...@good........ 00000030
-        |00000300 0000c8ff ffff0211 00510002| .............Q.. 00000040
-        |62626209 00040200 1c015800 30626262| bbb.......X.0bbb 00000050
-        |3f000f58 001d3463 63635300 0102000d| ?..X..4cccS..... 00000060
-        |58003f63 63635800 02216261 af000170| X.?cccX..!ba...p 00000070
-        |0007b000 50ff0200 0000|              ....P.....       00000080
-                                                               0000008a
+        |88000000 20010000 7c000002 61616100| .... ...|...aaa. 00000000
+        |01001008 11008040 0000006b 6579ff01| .......@...key.. 00000010
+        |00001100 30616161 0b0010ff 1c001176| ....0aaa.......v 00000020
+        |0a000218 0040676f 6f640c00 001800d0| .....@good...... 00000030
+        |06000000 03000000 c8ffffff 02110051| ...............Q 00000040
+        |00026262 62090008 02001001 0d000c60| ..bbb..........` 00000050
+        |00306262 6247000f 60001d30 6363634e| .0bbbG..`..0cccN 00000060
+        |00090200 0f600002 3f636363 60000221| .....`..?ccc`..! 00000070
+        |6261bf00 01780007 c00050ff 02000000| ba...x....P..... 00000080
+                                                               00000090
         ");
 
         // New MemTable. This time we attempt to spill an invalid, non-reduced document.
@@ -1281,12 +1452,12 @@ mod test {
 
         for (key, value) in test_keys.iter() {
             let doc = HeapNode::from_node(&json!({"key": key, "value": value}), memtable.alloc());
-            memtable.add(0, doc, false).unwrap();
+            memtable.add(0, doc, false, 0).unwrap();
         }
         memtable.compact().unwrap();
 
         let actual: Vec<(String, i32)> = memtable
-            .try_into_drainer()
+            .try_into_drainer(None)
             .unwrap()
             .map_ok(|doc| {
                 let json_val = serde_json::to_value(SerPolicy::noop().on_owned(&doc.root)).unwrap();
@@ -1348,7 +1519,7 @@ mod test {
 
             let add = |front: bool, doc: Value| {
                 let doc = HeapNode::from_node(&doc, memtable.alloc());
-                memtable.add(0, doc, front).unwrap();
+                memtable.add(0, doc, front, 0).unwrap();
             };
 
             add(
@@ -1375,7 +1546,7 @@ mod test {
 
             // Read back all spilled documents and verify redaction
             let (spill, ranges) = spill.into_parts();
-            let drainer = crate::combine::SpillDrainer::new(spec, spill, &ranges).unwrap();
+            let drainer = crate::combine::SpillDrainer::new(spec, spill, &ranges, None).unwrap();
 
             let docs: String = drainer
                 .map(|doc| {
@@ -1400,7 +1571,7 @@ mod test {
 
             let add = |doc: Value| {
                 let doc = HeapNode::from_node(&doc, memtable.alloc());
-                memtable.add(0, doc, false).unwrap();
+                memtable.add(0, doc, false, 0).unwrap();
             };
 
             // These will be reduced together (heap + embedded).
@@ -1436,7 +1607,7 @@ mod test {
             );
 
             // Drain and verify redaction happens after reduction
-            let drainer = memtable.try_into_drainer().unwrap();
+            let drainer = memtable.try_into_drainer(None).unwrap();
 
             let docs: String = drainer
                 .map(|doc| {
@@ -1467,7 +1638,7 @@ mod test {
             // Add > 2 to trigger reduction during MemTable::compact().
             for _ in 0..3 {
                 let doc = HeapNode::from_node(&invalid_doc, memtable.alloc());
-                memtable.add(0, doc, false).unwrap();
+                memtable.add(0, doc, false, 0).unwrap();
             }
 
             let failed = match memtable.compact() {
@@ -1505,11 +1676,11 @@ mod test {
             // Exactly 2 so that compact() succeeds, but drain_next() fails on attempted full reduction.
             for _ in 0..2 {
                 let doc = HeapNode::from_node(&invalid_doc, memtable.alloc());
-                memtable.add(0, doc, false).unwrap();
+                memtable.add(0, doc, false, 0).unwrap();
             }
 
             memtable.compact().expect("no validation error yet");
-            let mut drainer = memtable.try_into_drainer().unwrap();
+            let mut drainer = memtable.try_into_drainer(None).unwrap();
 
             let failed = match drainer.drain_next() {
                 Err(Error::FailedValidation(_name, failed)) => failed,
@@ -1564,9 +1735,9 @@ mod test {
         let memtable = MemTable::new(spec);
 
         let doc = HeapNode::from_node(&json!({"key": "aaa", "v": 1}), memtable.alloc());
-        memtable.add(0, doc, false).unwrap();
+        memtable.add(0, doc, false, 0).unwrap();
 
-        let drainer = memtable.try_into_drainer().unwrap();
+        let drainer = memtable.try_into_drainer(None).unwrap();
         // Drop the drainer without fully draining and recover the Spec.
         let spec = drainer.into_spec();
         assert_eq!(spec.names, vec!["test-source"]);

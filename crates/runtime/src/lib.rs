@@ -245,7 +245,7 @@ impl Accumulator {
     fn into_drainer(
         self,
     ) -> Result<(doc::combine::Drainer, simd_doc::Parser), doc::combine::Error> {
-        Ok((self.0.into_drainer()?, self.1))
+        Ok((self.0.into_drainer(None)?, self.1))
     }
 
     fn from_drainer(

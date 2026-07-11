@@ -111,9 +111,9 @@ fn reduce_combiner(input: Vec<ArbitraryValue>) -> bool {
     for rhs in input.into_iter().map(|a| a.0) {
         for binding in 0..2 {
             let d1 = HeapNode::from_node(&rhs, memtable_1.alloc());
-            () = memtable_1.add(binding, d1, false).unwrap();
+            () = memtable_1.add(binding, d1, false, 0).unwrap();
             let d2 = HeapNode::from_node(&rhs, memtable_2.alloc());
-            () = memtable_2.add(binding, d2, false).unwrap();
+            () = memtable_2.add(binding, d2, false, 0).unwrap();
         }
         json_patch::merge(&mut expect, &rhs);
     }
@@ -121,20 +121,20 @@ fn reduce_combiner(input: Vec<ArbitraryValue>) -> bool {
     // Add initial `seed` at the front.
     for binding in 0..2 {
         let d1 = HeapNode::from_node(&seed, memtable_1.alloc());
-        memtable_1.add(binding, d1, true).unwrap();
+        memtable_1.add(binding, d1, true, 0).unwrap();
         let d2 = HeapNode::from_node(&seed, memtable_2.alloc());
-        memtable_2.add(binding, d2, true).unwrap();
+        memtable_2.add(binding, d2, true, 0).unwrap();
     }
 
     // Drain `memtable_1` using a MemDrainer.
-    let mut mem_drainer = memtable_1.try_into_drainer().unwrap().peekable();
+    let mut mem_drainer = memtable_1.try_into_drainer(None).unwrap().peekable();
 
     // Drain `memtable_2` using a SpillDrainer.
     let mut spill = SpillWriter::new(io::Cursor::new(Vec::new())).unwrap();
     let spec = memtable_2.spill(&mut spill, 1 << 18).unwrap();
     let (mut spill, ranges) = spill.into_parts();
 
-    let mut spill_drainer = SpillDrainer::new(spec, &mut spill, &ranges).unwrap();
+    let mut spill_drainer = SpillDrainer::new(spec, &mut spill, &ranges, None).unwrap();
 
     let mut actual_associative = None;
     let mut actual_full = json!(null);

@@ -438,7 +438,7 @@ pub fn recv_connector_captured(
             anyhow::bail!("unable to create document UUID placeholder");
         };
     }
-    memtable.add(binding_index as u16, doc, false)?;
+    memtable.add(binding_index as u16, doc, false, 0)?;
 
     let stats = txn.stats.entry(binding_index).or_default();
     stats.0.docs_total += 1;
@@ -556,9 +556,9 @@ pub fn recv_connector_checkpoint(
 
     // Combine over the checkpoint state.
     if !merge_patch {
-        memtable.add(task.bindings.len() as u16, doc::HeapNode::Null, false)?;
+        memtable.add(task.bindings.len() as u16, doc::HeapNode::Null, false, 0)?;
     }
-    memtable.add(task.bindings.len() as u16, doc, false)?;
+    memtable.add(task.bindings.len() as u16, doc, false, 0)?;
 
     txn.checkpoints += 1;
     Ok(())

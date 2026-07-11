@@ -87,6 +87,7 @@ impl Spec {
 /// - It's u16 binding index.
 /// - First 13 bytes of it's extracted key tuple.
 /// - Flags
+/// - Combiner epoch.
 #[derive(Eq, PartialEq, Clone, Copy)]
 pub struct Meta(
     // Packed bytes of:
@@ -103,6 +104,8 @@ pub struct Meta(
     [u8; 15],
     // Flags
     u8,
+    // Epoch
+    u64,
 );
 
 /// HeapEntry is a combiner entry that exists in memory.
@@ -169,7 +172,9 @@ impl Accumulator {
 
     /// Map this combine Accumulator into a Drainer, which will drain directly
     /// from the inner MemTable (if no spill occurred) or from an inner SpillDrainer.
-    pub fn into_drainer(self) -> Result<Drainer, Error> {
+    /// Emits only each binding's active epoch; `active_epochs` is indexed by
+    /// binding, or `None` drains everything at epoch zero.
+    pub fn into_drainer(self, active_epochs: Option<Box<[u64]>>) -> Result<Drainer, Error> {
         let Self {
             memtable: Some(memtable),
             mut spill,
@@ -183,7 +188,7 @@ impl Accumulator {
 
             Ok(Drainer::Mem {
                 spill,
-                drainer: memtable.try_into_drainer()?,
+                drainer: memtable.try_into_drainer(active_epochs)?,
             })
         } else {
             // Spill the final MemTable segment.
@@ -191,7 +196,7 @@ impl Accumulator {
             let (spill, ranges) = spill.into_parts();
 
             Ok(Drainer::Spill {
-                drainer: SpillDrainer::new(spec, spill, &ranges)?,
+                drainer: SpillDrainer::new(spec, spill, &ranges, active_epochs)?,
             })
         }
     }
@@ -270,7 +275,7 @@ impl Combiner {
 
 impl Meta {
     #[inline]
-    fn new(binding: u16, key: &[u8], front: bool, known_valid: bool) -> Self {
+    fn new(binding: u16, key: &[u8], front: bool, known_valid: bool, epoch: u64) -> Self {
         let b = binding.to_be_bytes();
         let mut packed = [b[0], b[1], 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
         // Copy up to 13 bytes of `key` into the packed representation.
@@ -286,7 +291,7 @@ impl Meta {
         if known_valid {
             flags |= META_FLAG_KNOWN_VALID;
         }
-        Self(packed, flags)
+        Self(packed, flags, epoch)
     }
 
     /// Build a Meta from a pre-extracted 16-byte packed key prefix.
@@ -297,6 +302,7 @@ impl Meta {
         packed_key_prefix: &[u8; 16],
         front: bool,
         known_valid: bool,
+        epoch: u64,
     ) -> Self {
         let b = binding.to_be_bytes();
         let p = packed_key_prefix;
@@ -313,7 +319,7 @@ impl Meta {
         if known_valid {
             flags |= META_FLAG_KNOWN_VALID;
         }
-        Self(packed, flags)
+        Self(packed, flags, epoch)
     }
 
     /// The binding for this entry.
@@ -328,6 +334,14 @@ impl Meta {
     #[inline]
     pub fn front(&self) -> bool {
         self.1 & META_FLAG_FRONT != 0
+    }
+
+    /// The accumulator-local epoch of this entry. Differing epochs of a
+    /// shared (binding, key) never reduce; drain emits only the greatest (active)
+    /// one, carrying stale entries' front() onto it. Non-partitioning callers use 0.
+    #[inline]
+    pub fn epoch(&self) -> u64 {
+        self.2
     }
 
     /// Is this entry known to be valid? Known-valid entries skip validation
@@ -377,6 +391,11 @@ impl Meta {
     fn set_not_associative(&mut self) {
         self.1 |= META_FLAG_NOT_ASSOCIATIVE;
     }
+
+    #[inline]
+    fn set_front(&mut self) {
+        self.1 |= META_FLAG_FRONT;
+    }
 }
 
 impl std::fmt::Debug for Meta {
@@ -396,6 +415,10 @@ impl std::fmt::Debug for Meta {
         if self.known_valid() {
             s.field(&"V");
         }
+        let epoch = self.epoch();
+        if epoch != 0 {
+            s.field(&format_args!("e{epoch}"));
+        }
         s.finish()
     }
 }
@@ -412,6 +435,15 @@ const META_FLAG_KNOWN_VALID: u8 = 0x08;
 // The number of used bytes within a Bump allocator.
 fn bump_mem_used(alloc: &bumpalo::Bump) -> usize {
     alloc.allocated_bytes() - alloc.chunk_capacity()
+}
+
+// The active epoch of `binding` within a drainer's `active_epochs`.
+// `None` — or a binding beyond the slice — is the epoch-zero default.
+#[inline]
+fn active_epoch(active_epochs: Option<&[u64]>, binding: usize) -> u64 {
+    active_epochs
+        .and_then(|g| g.get(binding).copied())
+        .unwrap_or(0)
 }
 
 // The bump-allocator threshold after which we'll spill a MemTable to a SpillWriter.
@@ -520,11 +552,11 @@ mod test {
         ] {
             let mt = acc.memtable().unwrap();
             let node = HeapNode::from_node(&doc_json, mt.alloc());
-            mt.add(0, node, false).unwrap();
+            mt.add(0, node, false, 0).unwrap();
         }
 
         // No spill occurred — drain via the Mem variant.
-        let mut drainer = acc.into_drainer().unwrap();
+        let mut drainer = acc.into_drainer(None).unwrap();
         assert!(matches!(&drainer, Drainer::Mem { .. }));
 
         let actual = drain_all(&mut drainer);
@@ -560,9 +592,9 @@ mod test {
         // Add more docs and drain again to verify the recycled accumulator works.
         let mt = acc.memtable().unwrap();
         let node = HeapNode::from_node(&json!({"key": "ccc", "v": ["carrot"]}), mt.alloc());
-        mt.add(0, node, false).unwrap();
+        mt.add(0, node, false, 0).unwrap();
 
-        let mut drainer = acc.into_drainer().unwrap();
+        let mut drainer = acc.into_drainer(None).unwrap();
         let actual = drain_all(&mut drainer);
         assert_eq!(actual.len(), 1);
         assert_eq!(actual[0].1["key"], "ccc");
@@ -581,7 +613,7 @@ mod test {
         ] {
             let mt = acc.memtable().unwrap();
             let node = HeapNode::from_node(&doc_json, mt.alloc());
-            mt.add(0, node, false).unwrap();
+            mt.add(0, node, false, 0).unwrap();
         }
 
         // Force a spill by taking the memtable and spilling it.
@@ -600,11 +632,11 @@ mod test {
         ] {
             let mt = acc.memtable().unwrap();
             let node = HeapNode::from_node(&doc_json, mt.alloc());
-            mt.add(0, node, false).unwrap();
+            mt.add(0, node, false, 0).unwrap();
         }
 
         // Drain via the Spill variant.
-        let mut drainer = acc.into_drainer().unwrap();
+        let mut drainer = acc.into_drainer(None).unwrap();
         assert!(matches!(&drainer, Drainer::Spill { .. }));
 
         let actual = drain_all(&mut drainer);
@@ -649,9 +681,9 @@ mod test {
 
         let mt = acc.memtable().unwrap();
         let node = HeapNode::from_node(&json!({"key": "ddd", "v": ["dill"]}), mt.alloc());
-        mt.add(0, node, false).unwrap();
+        mt.add(0, node, false, 0).unwrap();
 
-        let mut drainer = acc.into_drainer().unwrap();
+        let mut drainer = acc.into_drainer(None).unwrap();
         let actual = drain_all(&mut drainer);
         assert_eq!(actual.len(), 1);
         assert_eq!(actual[0].1["key"], "ddd");
@@ -664,10 +696,10 @@ mod test {
 
         let mt = acc.memtable().unwrap();
         let node = HeapNode::from_node(&json!({"key": "aaa", "v": ["apple"]}), mt.alloc());
-        mt.add(0, node, false).unwrap();
+        mt.add(0, node, false, 0).unwrap();
 
         // Exercise the Iterator impl (which delegates to drain_next).
-        let drainer = acc.into_drainer().unwrap();
+        let drainer = acc.into_drainer(None).unwrap();
         let actual: Vec<_> = drainer
             .map(|r| {
                 let doc = r.unwrap();

@@ -269,7 +269,7 @@ pub fn recv_client_load_or_flush(
                 }
             }
 
-            memtable.add(binding_index as u16, doc, false)?;
+            memtable.add(binding_index as u16, doc, false, 0)?;
 
             let (prev_max, next_max) = &mut max_keys[binding_index as usize];
 
@@ -359,7 +359,7 @@ pub async fn recv_connector_acked_or_loaded_or_flushed(
                     )
                 })?;
 
-            memtable.add(binding_index as u16, doc, true)?;
+            memtable.add(binding_index as u16, doc, true, 0)?;
 
             // Accumulate metrics over reads for our transforms.
             let stats = &mut txn.stats.entry(binding_index).or_default();
