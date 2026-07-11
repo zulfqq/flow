@@ -410,13 +410,13 @@ async fn do_combine(
 
         for (node, _next_offset) in docs {
             in_docs += 1;
-            memtable.add(0, node, false)?;
+            memtable.add(0, node, false, 0)?;
         }
     }
 
     let mut out = io::BufWriter::new(io::stdout().lock());
 
-    let mut drainer = accumulator.into_drainer()?;
+    let mut drainer = accumulator.into_drainer(None)?;
     while let Some(drained) = drainer.next() {
         let drained = drained?;
 
