@@ -348,6 +348,16 @@ async fn shuffle_scenarios() {
         log_dir.path(),
     )
     .await;
+    data_plane.reset().await.expect("reset");
+
+    gapped_backfill_blocks_other_journal(
+        &materialization_spec,
+        &capture_spec,
+        &data_plane.journal_client,
+        &service,
+        log_dir.path(),
+    )
+    .await;
 
     server_handle.abort();
     data_plane
@@ -1638,6 +1648,167 @@ async fn gapped_continue_trigger(
             read: read2,
         }
     );
+
+    resumed.close().await.expect("close resumed");
+}
+
+/// A backfill blocks all main-read → Log draining for the whole Slice until it
+/// completes (spec §Ordering and scheduling; "Parked slice" accepted risk). This
+/// asserts the blocking gate does not drop or deadlock an unrelated journal's
+/// ready documents: while P2's gapped span in `apples` is being backfilled, P3
+/// commits a fresh document to a *different* journal (`bananas`) read by the same
+/// single-shard Slice. P3's document is not appended while the backfill is in
+/// flight; once the backfill completes and the parked trigger is re-presented,
+/// normal draining resumes and P3 flows. Both P2's recovered span and P3's
+/// document must be delivered exactly once, and P1's already-committed document
+/// must never be re-read.
+async fn gapped_backfill_blocks_other_journal(
+    materialization_spec: &flow::MaterializationSpec,
+    capture_spec: &flow::CaptureSpec,
+    journal_client: &gazette::journal::Client,
+    service: &shuffle::Service,
+    log_dir: &std::path::Path,
+) {
+    let phase1_dir = log_dir.join("gapped_blocks_p1");
+    let resume_dir = log_dir.join("gapped_blocks_resume");
+    std::fs::create_dir_all(&phase1_dir).unwrap();
+    std::fs::create_dir_all(&resume_dir).unwrap();
+
+    let p1 = uuid::Producer::from_bytes([0x01, 0x00, 0x00, 0x00, 0x00, 0x01]);
+    let p2 = uuid::Producer::from_bytes([0x03, 0x00, 0x00, 0x00, 0x00, 0x02]);
+    let p3 = uuid::Producer::from_bytes([0x05, 0x00, 0x00, 0x00, 0x00, 0x03]);
+    let mut pub1 = make_publisher(capture_spec, journal_client, p1);
+    let mut pub2 = make_publisher(capture_spec, journal_client, p2);
+    let mut pub3 = make_publisher(capture_spec, journal_client, p3);
+
+    // P2 opens an uncommitted CONTINUE span in `apples` (begin F = 0).
+    pub2.enqueue(
+        |uuid| {
+            Ok((
+                0,
+                serde_json::json!({
+                    "_meta": {"uuid": uuid.to_string()},
+                    "id": "gb-p2",
+                    "category": "alpha",
+                    "value": 20,
+                }),
+            ))
+        },
+        uuid::Flags::CONTINUE_TXN,
+    )
+    .await
+    .unwrap();
+    pub2.flush().await.unwrap();
+
+    // P1 commits an OUTSIDE document in `apples`, advancing M past F. P2 is gapped.
+    pub1.enqueue(
+        |uuid| {
+            Ok((
+                0,
+                serde_json::json!({
+                    "_meta": {"uuid": uuid.to_string()},
+                    "id": "gb-p1",
+                    "category": "alpha",
+                    "value": 10,
+                }),
+            ))
+        },
+        uuid::Flags::OUTSIDE_TXN,
+    )
+    .await
+    .unwrap();
+    pub1.flush().await.unwrap();
+
+    // Session 1: capture a checkpoint with P1 committed and P2 pending in apples.
+    let mut session = shuffle::SessionClient::open(
+        service,
+        build_task(materialization_spec),
+        build_shards(1, service.peer_endpoint(), &phase1_dir),
+        Default::default(),
+    )
+    .await
+    .expect("SessionClient::open phase 1");
+
+    let frontier1 = next_resolved_checkpoint(&mut session, "gapped blocks phase 1").await;
+    session.close().await.expect("close phase 1");
+
+    // Resume: P2 (F = 0 < M) is gapped in apples; its span is skipped.
+    let mut resumed = shuffle::SessionClient::open(
+        service,
+        build_task(materialization_spec),
+        build_shards(1, service.peer_endpoint(), &resume_dir),
+        frontier1.clone(),
+    )
+    .await
+    .expect("SessionClient::open resumed");
+
+    // P2 commits its apples span — its ACK triggers the backfill on resume. P3
+    // commits a fresh OUTSIDE document to the *bananas* journal, read by the same
+    // Slice: it is ready while the apples backfill is in flight, and the blocking
+    // gate must hold it until the backfill completes, then let it flow.
+    let (producer, commit_clock, journals) = pub2.commit_intents();
+    let acks = publisher::intents::build_transaction_intents(&[(producer, commit_clock, journals)]);
+    pub2.write_intents(acks).await.unwrap();
+
+    pub3.enqueue(
+        |uuid| {
+            Ok((
+                1,
+                serde_json::json!({
+                    "_meta": {"uuid": uuid.to_string()},
+                    "id": "gb-p3",
+                    "category": "alpha",
+                    "value": 30,
+                }),
+            ))
+        },
+        uuid::Flags::OUTSIDE_TXN,
+    )
+    .await
+    .unwrap();
+    pub3.flush().await.unwrap();
+
+    // Poll until both P2 (apples, recovered via backfill) and P3 (bananas) are
+    // committed. They commit in separate flush cycles — P2's ACK after the
+    // backfill completes, then P3 once draining resumes — so accumulate deltas.
+    let mut frontier2 = shuffle::Frontier::default();
+    let committed = |f: &shuffle::Frontier, p: uuid::Producer| {
+        f.journals.iter().any(|jf| {
+            jf.producers
+                .iter()
+                .any(|pf| pf.producer == p && pf.last_commit > uuid::Clock::zero())
+        })
+    };
+    loop {
+        let delta = next_resolved_checkpoint(&mut resumed, "gapped blocks backfill").await;
+        frontier2 = frontier2.reduce(delta);
+        if committed(&frontier2, p2) && committed(&frontier2, p3) {
+            break;
+        }
+    }
+
+    let mut resumed_shard_state: ShardState = (0..1).map(|_| None).collect();
+    let mut read2 = collect_read_entries(&frontier2, &resume_dir, &mut resumed_shard_state);
+
+    // Exactly-once completeness/safety, order-independent: P2's recovered apples
+    // document and P3's bananas document, each once; P1's is never re-read.
+    let mut delivered: Vec<(u16, String)> = read2
+        .iter()
+        .map(|e| (e.binding, e.doc["id"].as_str().unwrap().to_string()))
+        .collect();
+    delivered.sort();
+    assert_eq!(
+        delivered,
+        vec![(0, "gb-p2".to_string()), (1, "gb-p3".to_string())],
+        "both the backfilled apples span and the unrelated bananas commit must be delivered exactly once",
+    );
+
+    // Snapshot the read entries in log order. Journal creation/read races across
+    // the two bindings make the inter-journal order unstable, so sort for a
+    // deterministic snapshot; the exactly-once assertion above is the substantive
+    // check that the blocking gate neither drops nor duplicates B's document.
+    read2.sort_by(|a, b| (a.binding, &a.journal).cmp(&(b.binding, &b.journal)));
+    insta::assert_debug_snapshot!("gapped_backfill_blocks_other_journal_resumed", read2);
 
     resumed.close().await.expect("close resumed");
 }

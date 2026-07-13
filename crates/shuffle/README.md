@@ -275,16 +275,17 @@ historical I/O), a newer OUTSIDE that clears the gap, or a backfill *trigger* �
 the first newer document, CONTINUE or ACK.
 
 On a trigger the main read *parks* at that document: all live recovery state is
-consolidated in one actor-owned `Backfill` (in `SliceActor::backfills`, keyed by
-read id) holding the shelved `ReadyRead` (whose head IS the trigger), the target
-producer, the reconstructed `live` sequencing state, and an optional batch
-cursor. A bounded historical read of `[F, trigger.begin)` runs in
-`pending_backfills` (with the plain read id — it never shares the heap or
-`pending_reads` with main reads). Each resolved batch becomes the `Backfill`'s
-cursor, drained by `try_drain_backfills` directly in `try_log_request_tx`:
-target-producer documents are sequenced against `live` and appended through the
-normal path (others are skipped), and the inner read is re-polled only once the
-cursor is fully drained.
+consolidated in the single actor-owned `Backfill` (`SliceActor::backfill`)
+holding the shelved `ReadyRead` (whose head IS the trigger), the target
+producer, the reconstructed `live` sequencing state, and the historical read's
+I/O state (`BackfillIo`: either `Reading` the next batch or `Draining` a
+resolved one). The bounded historical read of `[F, trigger.begin)` is polled by
+a dedicated `select!` arm while `Reading` (with the plain read id — it never
+shares the heap or `pending_reads` with main reads). Each resolved batch becomes
+a `Draining` cursor, drained by `try_drain_backfill` directly in
+`try_log_request_tx`: target-producer documents are sequenced against `live` and
+appended through the normal path (others are skipped), and the inner read is
+re-polled only once the batch is fully drained.
 
 Completion commits nothing: when the stream reaches `trigger.begin`, `live` (the
 reconstructed open span) is installed into `pending`, the gap is removed, and the
@@ -305,16 +306,29 @@ binding read-delay and strictly-ascending per-producer clocks, every historical
 document's adjusted clock is already in the past, so heap ordering, priority
 ordering, and clock gating are provable no-ops for them. The cursor drain runs
 after the flush-priority check (so all backfill appends precede the re-presented
-trigger's own append or commit) but independent of the heap and its tailing gate.
+trigger's own append or commit).
 
-Parked main reads and historical backfill reads live outside `pending_reads`,
-so they are exempt from the all-reads-tailing heap-drain gate and from
-stalled-read accounting: intentional parking and cold-storage I/O never block
-unrelated journals (though shared Log-channel capacity and disk back-pressure
-still apply). Gap state is never persisted; recovery is derived entirely from
-the durable producer checkpoint. When a read stops or the session ends its
-`gaps` are left inert (the read is never re-served); only an active backfill is
-torn down, releasing its parked main read and in-flight historical read.
+**A backfill blocks all main-read → Log I/O for the whole Slice until it
+completes.** After the flush-priority check and cursor drain, `try_log_request_tx`
+returns idle while a backfill is active — it does not touch the tailing gate or
+sequence any main-read document of any journal. The trigger was the globally-next
+document in (priority DESC, adjusted_clock ASC) order when it parked, so letting
+other journals overtake it to the logs would violate the same live cross-journal
+ordering the tailing gate enforces (a merely *stalled* read already
+head-of-line-blocks the whole drain; a *parked* one must too). This mirrors the
+legacy conservative restart, which re-read `[F, …)` on a non-tailing main read
+and blocked all draining anyway. Because triggers are discovered only by
+sequencing the heap top and the heap does not drain during a backfill, **at most
+one backfill exists per Slice, globally** — a structural invariant. Other
+journals' reads still *resolve* into the heap during the backfill; they simply
+don't drain until it completes and the parked trigger is re-presented, after
+which normal (priority, adjusted-clock) draining resumes.
+
+Gap state is never persisted; recovery is derived entirely from the durable
+producer checkpoint. When a read stops or the session ends its `gaps` are left
+inert (the read is never re-served); only an active backfill is torn down,
+releasing its parked main read and in-flight historical read. A benign journal
+removal during a backfill likewise drops it, which also unblocks the Slice.
 
 ### 7. Key Extraction and Append Routing
 

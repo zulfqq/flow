@@ -13,11 +13,19 @@
 //! main-read document of a gapped producer (a CONTINUE or ACK with `clock >
 //! last_commit`) is the *trigger*: the main read parks at it and the actor opens
 //! a bounded historical read of `[F, trigger.begin)`. All live sequencing state
-//! for that one active recovery is consolidated in a `Backfill` (owned by the
-//! actor in `SliceActor::backfills`, keyed by read id). The gap entry is
-//! retained for the whole backfill (its pinned `F` is read at completion for the
-//! range event); while parked it is inert, as the main read produces no
-//! documents.
+//! for the recovery is consolidated in a single actor-owned `Backfill`
+//! (`SliceActor::backfill`). The gap entry is retained for the whole backfill
+//! (its pinned `F` is read at completion for the range event); while parked it is
+//! inert, as the main read produces no documents.
+//!
+//! A backfill blocks all main-read → Log I/O for the whole Slice until it
+//! completes: triggers are discovered only by sequencing the ready heap's top,
+//! and the heap does not drain while a backfill is active (see the gate in
+//! `SliceActor::try_log_request_tx`). This makes **at most one backfill per
+//! Slice, globally**, a structural invariant — no second trigger can be reached
+//! while one is in flight. It parallels both the all-reads-tailing stalled-read
+//! gate and the legacy conservative restart (which re-read `[F, …)` on a
+//! non-tailing main read, blocking all draining anyway).
 //!
 //! This module is organized like `state.rs`: a pure decision layer
 //! (`begin_backfill`, `backfill_read_request`, `sequence_backfill_document` —
@@ -49,15 +57,24 @@
 //! crash before the eventual ACK flush recovers the unchanged positive `F`,
 //! re-creates the gap, and repeats idempotently.
 //!
-//! Backfilled documents do NOT flow through the ready heap. The trigger was
-//! sequenced to `Sequenced::Park` only after clearing the drain loop's
-//! clock-delay gate, so — same binding read-delay, and strictly-ascending
+//! Backfilled documents do NOT flow through the ready heap; they are appended
+//! directly. The historical-vs-trigger direct-append justification is that the
+//! trigger was sequenced to `Sequenced::Park` only after clearing the drain
+//! loop's clock-delay gate, so — same binding read-delay, and strictly-ascending
 //! per-producer clocks — every historical CONTINUE in `[F, trigger.begin)` has
 //! an adjusted clock already in the past. Heap ordering, priority ordering, and
 //! clock-delay gating are therefore provably no-ops for them; only the
 //! Log-append semantics matter (per-producer journal order preserved, and the
 //! one-transaction invariant enforced: no committing document appears inside the
 //! historical range).
+//!
+//! Ordering *relative to other journals* is trivially preserved because the
+//! Slice blocks all other draining for the backfill's duration: no other
+//! journal's document is appended while the backfill runs, so none can overtake
+//! the parked trigger. The only residual, user-visible relaxation is the one
+//! inherent to any recovery — backfilled documents are older than documents
+//! already appended before the restart — and that inversion window no longer
+//! grows during the backfill.
 
 use super::actor::{Buffers, SliceActor};
 use super::heap::ReadyReadEntry;
@@ -69,25 +86,28 @@ use proto_flow::shuffle;
 use proto_gazette::{broker, uuid};
 use tokio::sync::mpsc;
 
-/// All live state for one active backfill of a gapped producer's pending
-/// transaction, owned by the actor in `SliceActor::backfills` and keyed by read
-/// id. Consolidates what the heap-routed design split across three homes: the
-/// parked main read, the live target-producer sequencing state, and the
-/// in-flight historical read. At most one backfill is active per read (the read
-/// parks at the first trigger, so no second trigger can arrive while parked).
+/// All live state for the single active backfill of a gapped producer's pending
+/// transaction, owned by the actor in `SliceActor::backfill`. Consolidates what
+/// the heap-routed design split across three homes: the parked main read, the
+/// live target-producer sequencing state, and the in-flight historical read.
+/// At most one backfill exists per Slice, globally — a structural invariant, not
+/// a per-read one: the heap does not drain while a backfill is active, so no
+/// second trigger can be discovered until this one completes.
 ///
 /// While the backfill runs the producer's `ReadState::gaps` entry is retained
 /// but inert: the main read is parked, so no main-read document of the journal
 /// arrives and the pinned `F` cannot change. It is removed only at completion,
 /// rollback/OUTSIDE resolution, or release.
 pub struct Backfill {
+    /// Read id of the parked main read (index into `SliceActor::reads`).
+    pub read_key: u32,
     /// The shelved main read, its head document the *trigger* (the gapped
     /// producer's first newer CONTINUE or ACK). Held here (outside
-    /// `pending_reads`), so it's exempt from the tailing gate and stall
-    /// accounting and no later document of the journal is reachable while
-    /// parked. At completion it is re-presented to the ready heap with its head
-    /// unconsumed (`parked.meta` IS the trigger) and sequenced through the
-    /// normal path.
+    /// `pending_reads`), so no later document of the journal is reachable while
+    /// parked, and — because a backfill blocks all draining — no other journal's
+    /// document is appended ahead of it. At completion it is re-presented to the
+    /// ready heap with its head unconsumed (`parked.meta` IS the trigger) and
+    /// sequenced through the normal path.
     pub parked: Box<ReadyRead>,
     /// The gapped producer whose newer document triggered this backfill.
     pub target: uuid::Producer,
@@ -99,16 +119,32 @@ pub struct Backfill {
     /// carrying it changes nothing durably and visibility stays gated by the
     /// absence of an ACK — exactly as for any normal mid-span producer.
     pub live: ProducerState,
-    /// The historical batch currently being drained, if any. Its inner
-    /// `ReadLines` is returned to `pending_backfills` (re-polled) only once this
-    /// cursor is fully drained, so no cursor is ever pending when the stream
-    /// reaches its end.
-    pub cursor: Option<Box<ReadyRead>>,
+    /// The historical read's I/O state: either awaiting its next batch
+    /// (`Reading`) or draining a resolved batch document-by-document
+    /// (`Draining`). This two-state machine makes "the inner read is re-polled
+    /// only once the current batch is fully drained" a plain enum fact: the
+    /// `select!` arm polls the stream only while `Reading`.
+    pub io: BackfillIo,
     /// Trigger instant, for the backfill-duration histogram.
     pub started_at: std::time::Instant,
     /// Physical bytes fetched so far by the historical read, for the
     /// completion event.
     pub physical_bytes: u64,
+}
+
+/// The historical backfill read's I/O state. Exactly one variant holds the inner
+/// `ReadLines` at any time, so it is never both polled by the `select!` arm and
+/// drained by `try_drain_backfill`.
+pub enum BackfillIo {
+    /// Awaiting the next historical batch from Gazette. The `select!` arm polls
+    /// this stream (via `next_backfill_batch`); a resolved batch transitions to
+    /// `Draining`, a stream end completes the backfill.
+    Reading(super::ReadLines),
+    /// A resolved batch being drained document-by-document. The inner `ReadLines`
+    /// rides along in the `ReadyRead` and returns to `Reading` (re-polled) only
+    /// once the batch is fully drained — so no batch is ever pending when the
+    /// stream reaches its end.
+    Draining(Box<ReadyRead>),
 }
 
 /// Reconstruct a triggered backfill's live sequencing state from the recovered
@@ -180,19 +216,34 @@ pub(super) fn sequence_backfill_document(
     Ok(sequenced)
 }
 
+/// The parked trigger and reconstructed sequencing state produced by
+/// `park_backfill` and consumed by `start_backfill` to assemble the `Backfill`.
+/// The drain loop calls the two back-to-back, so this never crosses an await;
+/// it exists only because a `Backfill` cannot be constructed until
+/// `start_backfill` opens the historical read that its `io` field owns.
+pub(super) struct ParkedTrigger {
+    /// The shelved main read; `parked.meta` is the trigger.
+    parked: Box<ReadyRead>,
+    /// The gapped producer whose newer document triggered the backfill.
+    target: uuid::Producer,
+    /// Reconstructed live sequencing state; `live.offset` is the span begin `F`.
+    live: ProducerState,
+}
+
 impl SliceActor {
     /// Park the main read at a gapped producer's *trigger* (its first newer
     /// CONTINUE or ACK): pop and shelve the whole `ReadyRead` (its head IS the
     /// trigger, and no later document of the journal is reachable while parked),
-    /// and consolidate all live recovery state in a `Backfill`. The trigger is
-    /// NOT sequenced now; at completion it is re-presented to the ready heap and
-    /// sequenced through the normal path against the reconstructed span (spec
-    /// §Trigger and parking).
+    /// and reconstruct the live sequencing state. The trigger is NOT sequenced
+    /// now; at completion it is re-presented to the ready heap and sequenced
+    /// through the normal path against the reconstructed span (spec §Trigger and
+    /// parking).
     ///
-    /// Paired with `start_backfill`: the drain loop calls the two back-to-back,
-    /// so the transient parked-but-unstarted `Backfill` never survives across an
-    /// await.
-    pub(super) fn park_backfill(&mut self, read_key: u32, meta: &Meta) {
+    /// Paired with `start_backfill`, which opens the historical read and installs
+    /// the `Backfill`: the drain loop calls the two back-to-back. Because a
+    /// backfill blocks all heap draining, `Sequenced::Park` is only ever reached
+    /// while no backfill is active, so a fresh one can always be installed.
+    pub(super) fn park_backfill(&mut self, read_key: u32, meta: &Meta) -> ParkedTrigger {
         let read_id = read_key as usize;
 
         let parked = self.ready_read_heap.pop().unwrap().inner.unwrap();
@@ -211,21 +262,6 @@ impl SliceActor {
             .map(|ps| ps.last_commit)
             .unwrap_or_default();
 
-        // All live backfill state is consolidated here; `live` reconstructs the
-        // pending span from the recovered state and is installed into `pending`
-        // at completion.
-        _ = self.backfills.insert(
-            read_key,
-            Backfill {
-                parked,
-                target: meta.producer,
-                live: begin_backfill(gap_begin, recovered_last_commit),
-                cursor: None,
-                started_at: std::time::Instant::now(),
-                physical_bytes: 0,
-            },
-        );
-
         let binding = &self.topology.bindings[self.reads[read_id].binding_index as usize];
         service_kit::event!(
             tracing::Level::INFO,
@@ -241,20 +277,33 @@ impl SliceActor {
             "triggering backfill of gapped producer's pending transaction",
         );
         self.metrics.backfills_started.increment(1);
+
+        // `live` reconstructs the pending span from the recovered state and is
+        // installed into `pending` at completion.
+        ParkedTrigger {
+            parked,
+            target: meta.producer,
+            live: begin_backfill(gap_begin, recovered_last_commit),
+        }
     }
 
-    /// Begin the historical read half of a triggered backfill parked by
-    /// `park_backfill`: open the bounded, non-blocking historical read of
-    /// `[F, trigger.begin)` in `pending_backfills`.
-    pub(super) fn start_backfill(&mut self, read_key: u32) -> anyhow::Result<()> {
+    /// Open the historical read half of a triggered backfill parked by
+    /// `park_backfill` and install the single actor-owned `Backfill`: a bounded,
+    /// non-blocking read of `[F, trigger.begin)` held in `BackfillIo::Reading`.
+    pub(super) fn start_backfill(
+        &mut self,
+        read_key: u32,
+        parked: ParkedTrigger,
+    ) -> anyhow::Result<()> {
         let read_id = read_key as usize;
+        let ParkedTrigger {
+            parked,
+            target,
+            live,
+        } = parked;
 
-        // `F` and the trigger's begin are read back from the just-parked
-        // `Backfill`: `live.offset` is still F (no historical document sequenced
-        // yet) and `parked.meta` is the trigger.
-        let backfill = self.backfills.get(&read_key).expect("backfill was parked");
-        let gap_begin = backfill.live.offset; // F
-        let trigger_begin = backfill.parked.meta.begin_offset;
+        let gap_begin = live.offset; // F
+        let trigger_begin = parked.meta.begin_offset;
 
         // The range is always non-empty: `F < M <= trigger_begin`. The main read
         // starts at M and parks at the first document it reaches, so the trigger
@@ -268,8 +317,8 @@ impl SliceActor {
         // Start the bounded, non-blocking historical read. Same client, auth,
         // begin_mod_time, schema validation, and partition-filtered journal as
         // the main read; no write-head probe is needed for a bounded range. The
-        // read carries the plain `read_key` as its id: historical reads never
-        // share the heap or `pending_reads` with main reads.
+        // read carries the plain `read_key` as its id: the historical read never
+        // shares the heap or `pending_reads` with main reads.
         let binding = &self.topology.bindings[self.reads[read_id].binding_index as usize];
         let client = (*self.topology.journal_clients[binding.index as usize]).clone();
         let request = backfill_read_request(
@@ -283,95 +332,118 @@ impl SliceActor {
             read_key,
             false, // Never tailing: the range is bounded and historical.
         ));
-        self.pending_backfills.push(read.into_future());
+
+        // At most one backfill exists per Slice, globally: the heap does not
+        // drain while one is in flight, so no second trigger can be reached.
+        assert!(
+            self.backfill.is_none(),
+            "a backfill is installed only while none is active (the heap drain is blocked)",
+        );
+        self.backfill = Some(Backfill {
+            read_key,
+            parked,
+            target,
+            live,
+            io: BackfillIo::Reading(read),
+            started_at: std::time::Instant::now(),
+            physical_bytes: 0,
+        });
 
         Ok(())
     }
 
-    /// Drain every active backfill's batch cursor as far as it will go: append
+    /// Drain the active backfill's batch cursor as far as it will go: append
     /// recovered target-producer documents in journal order and skip others,
-    /// until each batch is exhausted (its historical read returns to
-    /// `pending_backfills`) or an Append channel lacks capacity (the cursor parks
-    /// at that document). Backfill documents never touch the main read's offset
-    /// baselines or `pending`/`settled` (spec §Read positions, §Completion).
+    /// until the batch is exhausted (its historical read returns to `Reading`,
+    /// re-polled by the `select!` arm) or an Append channel lacks capacity (the
+    /// cursor parks at that document). Backfill documents never touch the main
+    /// read's offset baselines or `pending`/`settled` (spec §Read positions,
+    /// §Completion).
     ///
     /// Called from `try_log_request_tx` after the flush-priority check and
-    /// independent of the ready heap and its tailing gate. Returns `Some(tx)`
-    /// when an Append channel lacked capacity — the caller wakes on `tx` and
-    /// retries — or `None` when all cursors are drained.
+    /// independent of the ready heap and its tailing gate (which the backfill
+    /// blocks entirely). Returns `Some(tx)` when an Append channel lacked
+    /// capacity — the caller wakes on `tx` and retries — or `None` otherwise.
     ///
-    /// Destructuring `self` into disjoint field borrows lets us mutate one
-    /// `Backfill` in place (via `iter_mut`) while reading `reads`/`topology` and
-    /// the Log channels — so no per-call key allocation is needed. Drain order
-    /// among concurrent backfills of different reads is arbitrary; there is no
-    /// cross-backfill ordering requirement.
-    pub(super) fn try_drain_backfills(
+    /// Sequences from the same `live` snapshot on each attempt, advancing `live`
+    /// only after the append is sent, so a retry after a full channel doesn't
+    /// double-sequence. Takes ownership of the single `Backfill` for the duration
+    /// so `io` can be restructured while `reads`/`topology` and the Log channels
+    /// are borrowed; it is put back before returning.
+    pub(super) fn try_drain_backfill(
         &mut self,
         buffers: &mut Buffers,
     ) -> anyhow::Result<Option<mpsc::Sender<shuffle::LogRequest>>> {
-        let Self {
-            backfills,
-            reads,
-            topology,
-            log_prev_journal,
-            log_request_tx,
-            pending_backfills,
-            ..
-        } = self;
-
-        for (&read_key, backfill) in backfills.iter_mut() {
-            let read_state = &reads[read_key as usize];
-            let binding = &topology.bindings[read_state.binding_index as usize];
-
-            loop {
-                // Peek the cursor's head, retained until its append succeeds so a
-                // retry after a full channel doesn't drop it.
-                let Some(cursor) = backfill.cursor.as_deref() else {
-                    break; // No batch to drain (drained, or not yet fetched).
-                };
-                let meta = cursor.meta; // `Meta` is Copy.
-
-                // Documents of other producers are already represented by
-                // checkpoint state or belong to independent gaps: skip without
-                // sequencing, state mutation, key extraction, or append.
-                if meta.producer != backfill.target {
-                    advance_backfill_cursor(backfill, pending_backfills);
-                    continue;
-                }
-
-                // Sequence the target's document against `live` from the SAME
-                // snapshot on each (re)attempt: `live` advances only after the
-                // append is sent, so a retry after a full channel doesn't
-                // double-sequence.
-                let sequenced = sequence_backfill_document(
-                    backfill.live.clone(),
-                    &read_state.journal,
-                    binding,
-                    &meta,
-                )?;
-
-                if sequenced.is_append {
-                    let cursor = backfill.cursor.as_deref().unwrap();
-                    if let Err(tx) = Self::try_log_request_append_tx(
-                        binding,
-                        buffers,
-                        &read_state.journal,
-                        &topology.shards,
-                        log_prev_journal,
-                        log_request_tx,
-                        cursor,
-                    ) {
-                        // Park the cursor here; `live` is unchanged so the wake
-                        // re-sequences this document from the same snapshot.
-                        return Ok(Some(tx));
-                    }
-                }
-
-                // Commit `live` forward (never `pending`/`settled`) and advance.
-                backfill.live = sequenced.producer_state;
-                advance_backfill_cursor(backfill, pending_backfills);
-            }
+        let Some(mut backfill) = self.backfill.take() else {
+            return Ok(None);
+        };
+        // Only a `Draining` batch has documents to append; `Reading` (awaiting
+        // the next batch) has nothing to do here.
+        if !matches!(backfill.io, BackfillIo::Draining(_)) {
+            self.backfill = Some(backfill);
+            return Ok(None);
         }
+
+        let read_state = &self.reads[backfill.read_key as usize];
+        let binding = &self.topology.bindings[read_state.binding_index as usize];
+
+        loop {
+            // Peek the cursor's head, retained until its append succeeds so a
+            // retry after a full channel doesn't drop it.
+            let BackfillIo::Draining(cursor) = &backfill.io else {
+                break; // Batch fully drained; its read returned to `Reading`.
+            };
+            let meta = cursor.meta; // `Meta` is Copy.
+
+            // Documents of other producers are already represented by checkpoint
+            // state or belong to independent gaps: skip without sequencing, state
+            // mutation, key extraction, or append.
+            if meta.producer != backfill.target {
+                backfill.io = advance_backfill_cursor(backfill.io);
+                continue;
+            }
+
+            let sequenced = match sequence_backfill_document(
+                backfill.live.clone(),
+                &read_state.journal,
+                binding,
+                &meta,
+            ) {
+                Ok(sequenced) => sequenced,
+                Err(err) => {
+                    // Restore before fail-fast so teardown's `Drop` accounting
+                    // still counts this backfill and its parked read as stopped.
+                    self.backfill = Some(backfill);
+                    return Err(err);
+                }
+            };
+
+            if sequenced.is_append {
+                let BackfillIo::Draining(cursor) = &backfill.io else {
+                    unreachable!("still draining the peeked cursor");
+                };
+                if let Err(tx) = Self::try_log_request_append_tx(
+                    binding,
+                    buffers,
+                    &read_state.journal,
+                    &self.topology.shards,
+                    &mut self.log_prev_journal,
+                    &self.log_request_tx,
+                    cursor,
+                ) {
+                    // Park the cursor here; `live` is unchanged so the wake
+                    // re-sequences this document from the same snapshot.
+                    self.backfill = Some(backfill);
+                    return Ok(Some(tx));
+                }
+            }
+
+            // Commit `live` forward (never `pending`/`settled`) and advance.
+            backfill.live = sequenced.producer_state;
+            backfill.io = advance_backfill_cursor(backfill.io);
+        }
+
+        self.backfill = Some(backfill);
         Ok(None)
     }
 
@@ -383,23 +455,22 @@ impl SliceActor {
     /// wholly-normal path — a CONTINUE extends the span and appends, an ACK
     /// commits it (causal hints, committed offset, flush) — now that the
     /// producer is no longer gapped.
-    fn complete_backfill(&mut self, read_key: u32) -> anyhow::Result<()> {
-        let read_id = read_key as usize;
+    fn complete_backfill(&mut self, backfill: Backfill) -> anyhow::Result<()> {
         let Backfill {
+            read_key,
             parked,
             target,
             live,
-            cursor,
+            io,
             started_at,
             physical_bytes,
-        } = self
-            .backfills
-            .remove(&read_key)
-            .expect("completing backfill has state");
+        } = backfill;
+        let read_id = read_key as usize;
         debug_assert!(
-            cursor.is_none(),
-            "the historical read reaches its end only after its final batch cursor is drained",
+            matches!(io, BackfillIo::Reading(_)),
+            "the historical read reaches its end from `Reading`, only after its final batch drained",
         );
+        drop(io); // The exhausted historical read.
 
         // Drop the gap now that its pending span is recovered. It was retained
         // for the whole backfill so the release paths stay unchanged; `gap_begin`
@@ -465,27 +536,34 @@ impl SliceActor {
         Ok(())
     }
 
-    /// Process a historical backfill read's resolution. Mirrors
-    /// `process_read_result` but never touches main-read offset baselines or
-    /// `write_head`, counts physical bytes into the backfill counter, stashes a
-    /// resolved batch as the backfill's cursor (drained by `try_drain_backfills`),
-    /// and on stream end completes the backfill.
+    /// Process the active backfill's historical read resolution, yielded by the
+    /// `select!` arm via `next_backfill_batch`. Mirrors `process_read_result` but
+    /// never touches main-read offset baselines or `write_head`, counts physical
+    /// bytes into the backfill counter, transitions a resolved batch to
+    /// `BackfillIo::Draining` (drained by `try_drain_backfill`), and on stream
+    /// end completes the backfill.
+    ///
+    /// Takes ownership of the `Backfill` for the duration; puts it back unless
+    /// the stream ended (completion consumes it) or the journal was removed (a
+    /// benign stop that also unblocks the Slice).
     pub(super) fn process_backfill_result(
         &mut self,
         result: Option<gazette::RetryResult<gazette::journal::read::LinesBatch>>,
-        read: super::ReadLines,
     ) -> anyhow::Result<()> {
-        let read_key = read.id();
+        let mut backfill = self
+            .backfill
+            .take()
+            .expect("a backfill batch resolved, so a backfill is in flight");
+        let read_key = backfill.read_key;
         let read_id = read_key as usize;
         let binding = &self.topology.bindings[self.reads[read_id].binding_index as usize];
-        let journal = read.fragment().journal.clone();
 
         let Some(result) = result else {
-            // The bounded stream reached `end_offset`. A batch cursor is returned
-            // to `pending_backfills` only once fully drained, so no cursor is
-            // pending here and every recovered Append precedes the final ACK
-            // flush on each Log channel. Complete the backfill.
-            return self.complete_backfill(read_key);
+            // The bounded stream reached `end_offset`. Its final batch was fully
+            // drained before we re-polled (so `io` is `Reading`), so every
+            // recovered Append precedes the final ACK flush on each Log channel.
+            // Complete the backfill (which consumes `backfill`).
+            return self.complete_backfill(backfill);
         };
 
         let lines_batch = match result {
@@ -497,26 +575,29 @@ impl SliceActor {
                     // Deletion or FULL suspension implies no fragments remain, so
                     // the range can never be recovered. This stops the backfill
                     // benignly, exactly as an EOF stops a main read — not a
-                    // failure. Count it as completed (no longer in flight) and
-                    // drop the `Backfill`, which releases the parked main read
-                    // and (by dropping `read`) cancels the historical stream. The
-                    // trigger is NOT re-presented and no progress is committed.
-                    // The read is now discarded, so its `gaps` are left inert (as
-                    // on a main-read EOF); its slot is never reused.
-                    let target = self.backfills[&read_key].target;
+                    // failure — and, because the backfill blocked the Slice, also
+                    // unblocks it. Count it as completed (no longer in flight) and
+                    // drop the `Backfill`, which releases the parked main read and
+                    // (by dropping `io`) cancels the historical stream. The trigger
+                    // is NOT re-presented and no progress is committed. The read is
+                    // now discarded, so its `gaps` are left inert (as on a
+                    // main-read EOF); its slot is never reused.
                     service_kit::event!(
                         tracing::Level::INFO,
                         "backfill",
                         read_id,
                         binding = binding.index,
-                        journal,
-                        producer = service_kit::event::debug(target),
+                        journal = self.reads[read_id].journal.to_string(),
+                        producer = service_kit::event::debug(backfill.target),
                         "backfill journal removed ({}); stopping backfill",
                         status.as_str_name(),
                     );
-                    _ = self.backfills.remove(&read_key);
+                    // The dropped `Backfill` releases the parked main read too,
+                    // which would otherwise stop uncounted (its own removal is
+                    // never observed: it is parked, not polled).
+                    self.metrics.reads_stopped.increment(1);
                     self.metrics.backfills_stopped.increment(1);
-                    return Ok(());
+                    return Ok(()); // `backfill` dropped here.
                 }
                 read::ReadFailure::Transient(err) => {
                     service_kit::event!(
@@ -524,18 +605,22 @@ impl SliceActor {
                         "backfill",
                         read_id,
                         binding = binding.index,
-                        journal,
+                        journal = self.reads[read_id].journal.to_string(),
                         attempt,
                         err = service_kit::event::debug(err),
                         "transient error during backfill read (will retry)",
                     );
-                    // Retry: hand the read straight back to `pending_backfills`.
-                    self.pending_backfills.push(read.into_future());
+                    // Retry: leave `io` in `Reading`; the `select!` arm re-polls
+                    // the same stream on the next iteration.
+                    self.backfill = Some(backfill);
                     return Ok(());
                 }
                 read::ReadFailure::Terminal(err) => {
                     // Fail-fast: the whole session tears down. The teardown is
-                    // the signal, so this is deliberately not counted.
+                    // the signal, so no dedicated event fires — but restore the
+                    // backfill so `Drop` accounting still counts it (and its
+                    // parked read) as stopped.
+                    self.backfill = Some(backfill);
                     return Err(read::map_read_error(
                         err,
                         &self.reads[read_id].journal,
@@ -553,11 +638,15 @@ impl SliceActor {
         // forward-read, so main-read byte deltas remain monotonic).
         let n = lines_batch.content.len() as u64;
         self.metrics.bytes_read.increment(n);
-        if let Some(backfill) = self.backfills.get_mut(&read_key) {
-            backfill.physical_bytes += n;
-        }
+        backfill.physical_bytes += n;
 
-        let ready_read = read::parse_lines_batch(
+        // Move the read out of `Reading` to build the batch cursor (which owns it
+        // as `inner`) and transition to `Draining`. A batch resolves only while
+        // `Reading`, so the pattern is irrefutable in practice.
+        let BackfillIo::Reading(read) = backfill.io else {
+            unreachable!("a batch resolves only while `Reading`");
+        };
+        let ready_read = match read::parse_lines_batch(
             &mut self.parser,
             &mut self.validators[self.reads[read_id].binding_index as usize],
             binding,
@@ -565,50 +654,71 @@ impl SliceActor {
             read,
             lines_batch,
             "transcoding backfill documents",
-        )?;
-        // Stash the parsed batch as this backfill's cursor; `try_drain_backfills`
-        // appends its target-producer documents on a later loop iteration. The
-        // inner read is re-polled only once the cursor is fully drained.
-        self.backfills
-            .get_mut(&read_key)
-            .expect("backfill has a parked main read")
-            .cursor = Some(Box::new(ready_read));
+        ) {
+            Ok(ready_read) => ready_read,
+            Err(err) => {
+                // The historical read was consumed, so the `Backfill` cannot be
+                // restored for `Drop` accounting; count it and its parked read
+                // as stopped here, as a main read's terminal path does.
+                self.metrics.reads_stopped.increment(1);
+                self.metrics.backfills_stopped.increment(1);
+                return Err(err);
+            }
+        };
+        backfill.io = BackfillIo::Draining(Box::new(ready_read));
+        self.backfill = Some(backfill);
 
         Ok(())
     }
 }
 
-/// Advance a backfill's cursor to its next buffered document, or (when the batch
-/// is exhausted) return the inner historical read to `pending_backfills` and
-/// clear the cursor. Mirrors the main-read drain's tail advance, but for the
-/// cursor rather than the heap. The just-consumed head is dropped.
-fn advance_backfill_cursor(
-    backfill: &mut Backfill,
-    pending_backfills: &mut futures::stream::FuturesUnordered<
-        futures::stream::StreamFuture<super::ReadLines>,
-    >,
-) {
+/// Await the next historical backfill batch, but only while a backfill is
+/// actively `Reading`; otherwise this future is pending, so the `select!` arm
+/// that drives it never fires. The read is left in place (borrowed, not moved),
+/// so dropping this future on a losing `select!` branch is cancellation-safe and
+/// re-polls the same stream next iteration. A resolved batch is handed to
+/// `process_backfill_result`, which moves the read into a `Draining` cursor.
+pub(super) async fn next_backfill_batch(
+    backfill: &mut Option<Backfill>,
+) -> Option<gazette::RetryResult<gazette::journal::read::LinesBatch>> {
+    match backfill {
+        Some(Backfill {
+            io: BackfillIo::Reading(read),
+            ..
+        }) => read.next().await,
+        // No backfill, or one that is `Draining` (drained by `try_drain_backfill`,
+        // not re-polled until its batch is exhausted): never resolves.
+        _ => std::future::pending().await,
+    }
+}
+
+/// Advance a `Draining` batch to its next buffered document, or (when the batch
+/// is exhausted) return the inner historical read to `Reading` so the `select!`
+/// arm re-polls it — only now, so no batch is pending when the stream reaches its
+/// end. Mirrors the main-read drain's tail advance, but for the cursor rather
+/// than the heap. The just-consumed head is dropped. Consumes and returns `io`;
+/// the caller must be in `Draining` (asserted).
+fn advance_backfill_cursor(io: BackfillIo) -> BackfillIo {
+    let BackfillIo::Draining(cursor) = io else {
+        unreachable!("advance is called only while draining a batch");
+    };
     let ReadyRead {
         inner: read,
         doc: _consumed_doc,
         meta: _consumed_meta,
         mut doc_tail,
         mut meta_tail,
-    } = *backfill.cursor.take().expect("cursor present");
+    } = *cursor;
 
     match (doc_tail.next(), meta_tail.next()) {
-        (Some((doc, _)), Some(meta)) => {
-            backfill.cursor = Some(Box::new(ReadyRead {
-                doc,
-                meta,
-                doc_tail,
-                meta_tail,
-                inner: read,
-            }));
-        }
-        // The batch is fully drained: re-poll the historical stream only now, so
-        // no cursor can be pending when it reaches its end.
-        (None, None) => pending_backfills.push(read.into_future()),
+        (Some((doc, _)), Some(meta)) => BackfillIo::Draining(Box::new(ReadyRead {
+            doc,
+            meta,
+            doc_tail,
+            meta_tail,
+            inner: read,
+        })),
+        (None, None) => BackfillIo::Reading(read),
         _ => unreachable!("doc_tail and meta_tail have equal length"),
     }
 }

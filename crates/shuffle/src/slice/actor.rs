@@ -44,10 +44,6 @@ pub struct SliceActor {
     >,
     /// Reads that are awaiting more data from Gazette brokers.
     pub pending_reads: stream::FuturesUnordered<stream::StreamFuture<super::ReadLines>>,
-    /// Historical backfill reads awaiting broker/storage I/O. A read lives here only
-    /// while no batch of it is being drained; once a batch resolves it becomes the
-    /// owning `Backfill`'s cursor, returning here only after the cursor drains.
-    pub pending_backfills: stream::FuturesUnordered<stream::StreamFuture<super::ReadLines>>,
     /// Number of pending reads that are caught up to their journal write head.
     /// We defer sending Append requests until all pending reads are tailing,
     /// ensuring no pending read has content that could preempt the current heap top.
@@ -60,11 +56,15 @@ pub struct SliceActor {
     pub parser: simd_doc::SimdParser,
     /// Ordered heap of reads with ready documents.
     pub ready_read_heap: ReadyReadHeap,
-    /// Active backfills of gapped producers' pending transactions, keyed by read
-    /// id. Each consolidates the parked main read (holding the trigger ACK head,
-    /// its undrained tail, and the inner `ReadLines`), the live target-producer
-    /// sequencing state, and the current historical batch cursor.
-    pub backfills: std::collections::HashMap<u32, Backfill>,
+    /// The single active backfill of a gapped producer's pending transaction, if
+    /// any. At most one backfill exists per Slice, globally: triggers are
+    /// discovered only by sequencing the heap top, and a backfill blocks all
+    /// main-read draining until it completes (see `try_log_request_tx`), so no
+    /// second trigger can be reached while one is in flight. It consolidates the
+    /// parked main read (the triggering head, its undrained tail, and the inner
+    /// `ReadLines`), the live target-producer sequencing state, and the in-flight
+    /// historical read / batch cursor (`BackfillIo`).
+    pub backfill: Option<Backfill>,
     /// Per-task metrics counters and gauges.
     pub metrics: super::Metrics,
 }
@@ -79,11 +79,11 @@ impl Drop for SliceActor {
         let live_reads = self.pending_probes.len()
             + self.pending_reads.len()
             + self.ready_read_heap.len()
-            + self.backfills.len();
+            + self.backfill.is_some() as usize;
         self.metrics.reads_stopped.increment(live_reads as u64);
         self.metrics
             .backfills_stopped
-            .increment(self.backfills.len() as u64);
+            .increment(self.backfill.is_some() as u64);
     }
 }
 
@@ -215,8 +215,13 @@ impl SliceActor {
                 Some((result, read)) = self.pending_reads.next() => {
                     self.on_pending_read_resolved(result, read)?;
                 }
-                Some((result, read)) = self.pending_backfills.next() => {
-                    self.process_backfill_result(result, read)?;
+                // The in-flight historical read of the single active backfill.
+                // `next_backfill_batch` is pending unless a backfill is actively
+                // `Reading` (not `Draining`, not absent), so this arm never fires
+                // otherwise. It leaves the read in place; a resolved batch
+                // transitions it to `Draining` in `process_backfill_result`.
+                result = super::gap::next_backfill_batch(&mut self.backfill) => {
+                    self.process_backfill_result(result)?;
                 }
 
                 // Periodic tick ensures tracing fires even when idle.
@@ -354,9 +359,8 @@ impl SliceActor {
             gaps,
         } = state::resolve_checkpoint(checkpoint);
 
-        // Emit a gap-creation event per gapped producer (F, M). All gap and
-        // backfill lifecycle events share the "backfill" track so an operator
-        // sees creation → trigger → completion/rollback as one ordered series.
+        // Emit a diagnostic for each gapped producer, on a "backfill" track
+        // that also surfaces triggered backfills and their completions.
         for (producer, gap_begin) in gaps.iter() {
             service_kit::event!(
                 tracing::Level::DEBUG,
@@ -568,8 +572,7 @@ impl SliceActor {
                 ReadFailure::JournalRemoved(status) => {
                     self.metrics.reads_stopped.increment(1);
                     // A dead main read has no active backfill (a backfilling read
-                    // is parked outside `pending_reads`) and its `gaps` are inert,
-                    // so no release is needed here.
+                    // is parked outside `pending_reads`).
                     service_kit::event!(
                         tracing::Level::INFO,
                         "read",
@@ -691,25 +694,35 @@ impl SliceActor {
                 }
             }
 
-            // Drain any historical backfill batch cursors: recovered
+            // Drain the active backfill's historical batch cursor: recovered
             // target-producer documents are appended directly, without heap
-            // ordering or clock-delay gating. This is sound because the trigger
-            // already cleared the clock-delay gate below, and same-binding
-            // read-delay plus strictly-ascending per-producer clocks put every
-            // historical document's adjusted clock in the past. Runs after the
-            // flush check but independent of the heap and its tailing gate; all
-            // backfill appends precede the re-presented trigger's own processing.
-            if let Some(tx) = self.try_drain_backfills(buffers)? {
+            // ordering or tailing / clock-delay gating. This is sound because the
+            // backfill trigger document already cleared those gates, and
+            // backfill'd docs share its binding and strictly precede its clock.
+            if let Some(tx) = self.try_drain_backfill(buffers)? {
                 return Ok(future::Either::Left(tx.reserve_owned().map(ok)));
+            }
+
+            // A backfill blocks all main-read → Log I/O for the whole Slice until
+            // it completes. New Log appends while backfilling come only from the
+            // backfill itself (drained above); we do NOT sequence or append any
+            // main-read document of any journal. The trigger was the globally-next
+            // document in (priority DESC, adjusted_clock ASC) order when it parked,
+            // so letting other journals overtake it here would violate the same
+            // live cross-journal ordering the tailing gate enforces — a merely
+            // stalled read head-of-line-blocks the drain, so a parked one must too.
+            // This is also what makes at-most-one backfill per Slice structural:
+            // the heap does not drain while a backfill is active, so no second
+            // trigger can be discovered. Completion re-presents the parked trigger
+            // and the next iteration resumes normal draining.
+            if self.backfill.is_some() {
+                return Ok(idle);
             }
 
             // Defer draining if any read could still resolve to content that
             // preempts the current heap top: a parked non-tailing (stalled) read,
             // or a newly-started read still probing its write head (parked in
-            // `pending_probes`, not yet classified as tailing/stalled). Parked
-            // main reads (`backfills`) and historical backfill reads
-            // (`pending_backfills`) are deliberately outside `pending_reads`, so
-            // they neither contribute to nor are blocked by this gate.
+            // `pending_probes`, not yet classified as tailing/stalled).
             if self.tailing_reads != self.pending_reads.len() || !self.pending_probes.is_empty() {
                 return Ok(idle);
             }
@@ -753,8 +766,11 @@ impl SliceActor {
                         // open its bounded historical backfill. The trigger is
                         // not sequenced now; on completion it is re-presented to
                         // the heap and sequenced through this same normal path.
-                        self.park_backfill(read_id as u32, &meta);
-                        self.start_backfill(read_id as u32)?;
+                        // `continue` re-enters the loop, which — now that a
+                        // backfill is active — returns idle at the blocking gate
+                        // above until the backfill completes.
+                        let parked = self.park_backfill(read_id as u32, &meta);
+                        self.start_backfill(read_id as u32, parked)?;
                         continue;
                     }
                     state::Sequenced::Doc { doc, gapped } => (doc, gapped),

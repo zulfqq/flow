@@ -258,15 +258,20 @@ The main read MUST park at the trigger before sequencing it:
 - the trigger document and metadata are retained;
 - the logical main-read position does not advance past the trigger;
 - no later document of that journal is processed; and
-- at most one backfill is active for a `(binding, journal)` read.
+- at most one backfill is active per Slice, globally (see below).
 
-The parked main read MUST be held outside the Slice's pending-read tailing gate
-and MUST NOT count as an ordinary stalled read. The historical read is likewise
-exempt from the tailing gate and ordinary stall accounting. Intentional parking
-is reported only through backfill-specific events and metrics.
-
-Other journals may continue to make progress, subject to ordinary shared Log
-back-pressure and flush coordination.
+While a backfill is active the Slice MUST NOT sequence or append any main-read
+document of any journal: the backfill blocks all main-read → Log I/O for the
+whole Slice until it completes. The parked main read and the historical read
+still do not count as ordinary *stalled* reads for observability — parking is
+intentional and reported only through backfill-specific events and metrics — but
+this is a scheduling exemption from stall *accounting*, not a licence to let
+other journals drain ahead. Because triggers are discovered only by sequencing
+the ready heap's top, and the heap does not drain while a backfill is active, at
+most one backfill can exist per Slice at any time (a structural invariant). Other
+journals' reads may still resolve into the heap, subject to ordinary shared Log
+back-pressure and flush coordination, but they do not drain to the logs until the
+backfill completes and the parked trigger is re-presented.
 
 ### Historical range
 
@@ -345,32 +350,24 @@ begins at the trigger.
 
 ## Ordering and scheduling
 
-Backfill is an explicit exception to shuffle's global
-`(priority DESC, adjusted_clock ASC)` processing order.
+A backfill blocks all main-read → Log I/O for the whole Slice until it
+completes. While a backfill is active, the Slice MUST NOT sequence or append any
+main-read document of any journal; new Log appends come only from the backfill
+itself. Draining resumes when the backfill completes and re-presents the parked
+trigger.
 
-A pending cold read has no document in the ready heap. Normal documents may be
-emitted before an older or higher-priority backfill document arrives, and logs
-may already contain later documents by the time backfill begins. Shuffle does
-not attempt to restore global ordering across that boundary.
+This is the same discipline the tailing gate already enforces for a merely
+*stalled* read (one that head-of-line-blocks the whole heap drain), and it
+matches the legacy conservative restart, which re-read `[F, …)` on a non-tailing
+main read and blocked all draining anyway. Because the trigger was the
+globally-next document in `(priority DESC, adjusted_clock ASC)` order when it
+parked, letting other journals drain ahead of it during the backfill would
+violate exactly that live cross-journal ordering (read delays, priorities).
 
-This relaxation is safe because:
-
-- downstream processing does not require global producer-clock order;
-- the recovered source transaction becomes visible atomically only when its
-  committing ACK is sequenced by the normal path — inherited ACK-gated
-  visibility, not a special boundary;
-- causal hints continue to gate cross-journal transaction visibility; and
-- strict order for the target `(binding, journal, producer)` is preserved: its
-  main-read documents below the trigger are skipped, the backfill appends
-  `[F, trigger.begin)` in journal order, and the re-presented trigger then
-  continues in order from `trigger.begin` onward.
-
-The relaxation is nevertheless user-visible. An old backfilled document may be
-processed after a newer same-key document written by another producer. A
-last-write-wins reduction can therefore select the historical value until a
-later update supersedes it. Downstream consumers are required to tolerate this
-cross-producer inversion; source-transaction atomicity, not global value order,
-is the guarantee retained by this design.
+Because triggers are discovered only by sequencing the ready heap's top, and the
+heap does not drain during a backfill, at most one backfill can exist per Slice,
+globally — a structural invariant. Other journals' reads may still resolve into
+the heap while the backfill runs; they simply do not drain until it completes.
 
 Backfilled documents are appended directly as an atomic sequence, without
 participating in the ready-heap ordering or the normal clock-delay gate. This
@@ -384,14 +381,30 @@ is. Priority is likewise identical across the binding. Heap ordering, priority
 ordering, and clock-delay gating are thus provable no-ops for backfilled
 documents, and an implementation MAY append them directly, provided all such
 appends precede the re-presented trigger's own append or commit on each shard
-log.
+log. Ordering relative to *other* journals is trivially preserved because none
+of their documents are appended while the backfill runs.
 
-The parked main read and pending historical read MUST both be exempt from the
-Slice condition that every pending read be tailing before the ready heap can
-drain. This prevents intentional parking and historical I/O from deliberately
-blocking unrelated journals. It does not promise resource isolation: backfill
-appends, Log channel capacity, flushes, and disk back-pressure remain shared
-and may indirectly stall other work.
+The only residual, user-visible relaxation is the one inherent to any recovery:
+backfilled documents are older than documents already appended before the
+restart, and the logs may already contain those later documents by the time the
+backfill begins. Shuffle does not attempt to restore global ordering across that
+restart boundary — but, unlike a design that let other journals interleave, the
+inversion window no longer grows during the backfill itself. An old backfilled
+document may thus be processed after a newer same-key document appended before
+the restart; a last-write-wins reduction can select the historical value until a
+later update supersedes it. Downstream consumers are required to tolerate this
+cross-producer inversion; source-transaction atomicity, not global value order,
+is the guarantee retained by this design. Within the target
+`(binding, journal, producer)` strict order is preserved: its main-read
+documents below the trigger are skipped, the backfill appends `[F, trigger.begin)`
+in journal order, and the re-presented trigger continues from `trigger.begin`
+onward. The recovered source transaction still becomes visible atomically only
+when its committing ACK is sequenced by the normal path (inherited ACK-gated
+visibility), and causal hints continue to gate cross-journal visibility.
+
+Blocking the drain does not promise resource isolation in the other direction
+either: while a backfill runs, its appends, Log channel capacity, flushes, and
+disk back-pressure remain shared and may indirectly stall it.
 
 ## Read positions and byte accounting
 
@@ -573,20 +586,27 @@ A source transaction whose per-shard log footprint exceeds
 visible. Backfill inherits this pre-existing bound and does not attempt to
 solve it.
 
-### Parked journal
+### Parked slice
 
-The triggering journal makes no forward progress while historical data is
-read. This cost is paid only when a tracked producer emits a newer document and
-is bounded by `[F, trigger.begin)`.
+A backfill stalls every journal of the Slice — including high-priority bindings —
+for its duration, not just the triggering journal: while it runs, no main-read
+document of any journal drains to the logs. This cost is paid only when a tracked
+producer emits a newer document, is bounded by `[F, trigger.begin)`, and matches
+both the stalled-read gate (a single non-tailing read already blocks the whole
+heap drain) and the legacy conservative restart (which re-read `[F, …)` on a
+non-tailing main read, blocking all draining anyway).
 
 ### Global priority order
 
-Backfilled documents may appear after documents that would sort later by
-priority or adjusted clock. Restoring global order would require a historical
-log class or reader-side merge and is explicitly not part of this design. In
-particular, same-key last-write-wins processing across different producers may
-temporarily or durably prefer the historical value until another update
-arrives.
+Backfilled documents may appear after documents that were appended before the
+restart and would sort later by priority or adjusted clock. Restoring global
+order across the restart boundary would require a historical log class or
+reader-side merge and is explicitly not part of this design. In particular,
+same-key last-write-wins processing across different producers may temporarily or
+durably prefer the historical value until another update arrives. This inversion
+is bounded to that restart boundary: because a backfill blocks all other
+draining, no document appended *during* the backfill can overtake the parked
+trigger, so the window does not grow while the backfill runs.
 
 ### Persisted journal watermark
 
@@ -669,10 +689,13 @@ Deterministic coverage must additionally verify:
 - deep rollback while gapped clears the gap without a backfill and preserves
   monotonic reduced-Frontier semantics;
 - rejection of a committing document inside a backfill's historical range;
-- neither a parked main read nor a cold historical read engages the
-  all-reads-tailing drain gate or ordinary stalled-read accounting;
-- global priority/adjusted-clock inversion is tolerated for a backfill while
-  per-producer order remains strict;
+- an active backfill blocks all other journals' main-read appends until it
+  completes (the parked main read and cold historical read are exempt only from
+  ordinary stalled-read accounting, not from the drain block), and normal
+  draining resumes once the parked trigger is re-presented;
+- global priority/adjusted-clock inversion is tolerated only across the restart
+  boundary — within the backfill's own historical range per-producer order
+  remains strict and no other journal's document interleaves;
 - FULL suspension releases gap state after fragments are gone, and a later
   appearance starts fresh;
 - an ambiguous hinted producer with `offset == 0` is conservatively backfilled
