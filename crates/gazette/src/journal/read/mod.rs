@@ -27,8 +27,7 @@ impl Client {
             loop {
                 // Have we read through requested `end_offset`? Use `>=`, not
                 // `==`: a fragment hole spanning `end_offset` can fast-forward
-                // `req.offset` *past* it (see `read_some`), and an equality check
-                // would then never terminate the stream.
+                // `req.offset` *past* `end_offset`.
                 if req.end_offset != 0 && req.offset >= req.end_offset {
                     return;
                 }
@@ -143,8 +142,7 @@ impl Client {
             // A fragment hole may have fast-forwarded `req.offset` to or past a
             // bounded read's `end_offset`. The requested range is then fully
             // covered; yield the metadata (so the caller observes the resolved
-            // offset) and terminate without reading further content, which a
-            // negative remaining budget would otherwise mishandle.
+            // offset) and terminate.
             if req.end_offset != 0 && req.offset >= req.end_offset {
                 () = co.yield_(Ok(metadata)).await;
                 metrics.tick(req.offset, *write_head);

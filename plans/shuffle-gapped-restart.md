@@ -31,14 +31,16 @@ nominal restart I/O.
 
 ## Intended outcome
 
-On restart, each journal begins near the furthest position justified by its
-checkpoint, while allowing a configured, bounded amount of conservative
-re-read. Producers whose pending spans begin before that bounded window are
-remembered as *gapped* and suppressed. Old dead producers then cost no further
-I/O. If one does later commit, shuffle parks at its ACK, re-reads only that
-producer's pending transaction, and publishes the transaction atomically
-through the normal log and Frontier machinery. Live producers clustered near
-the frontier are recovered together by the main read.
+On restart, each journal begins at the furthest position justified by its
+checkpoint. Producers whose pending spans begin before that position are
+remembered as *gapped* and skipped. Old dead producers then cost no further
+I/O. If one later emits any newer document, shuffle parks at that document,
+backfills only the skipped `[F, trigger)` range, then re-presents the parked
+document to the normal read path — which extends the reconstructed span (a
+CONTINUE trigger) or commits it (an ACK trigger) through the ordinary log and
+Frontier machinery. No prefix of a still-uncommitted span becomes visible,
+because visibility stays gated by the absence of a committing ACK exactly as it
+is for any live open span.
 
 The change has three primary goals:
 
@@ -95,40 +97,25 @@ For each `(binding, journal)` checkpoint, define:
 
 ```text
 M = max(magnitude(offset)) across all producer entries
-B = configured maximum near-frontier re-read bytes
-R = min({M} union {F | F is uncommitted and M - F <= B})
 ```
 
-An empty checkpoint resolves to `M = R = 0`. `B` MUST be non-negative.
+An empty checkpoint resolves to `M = 0`.
 
-The main journal read starts at `R`, subject to the same broker
+The main journal read starts at `M`, subject to the same broker
 `begin_mod_time` and fragment-hole behavior as existing reads.
-
-`B` controls the trade-off between one-pass conservative recovery and targeted
-backfill:
-
-- `B = 0` always chooses the maximum checkpoint position. Tests SHOULD use
-  this setting to exercise the backfill path aggressively.
-- A non-zero production value re-reads at most `B` bytes behind `M` and recovers
-  all uncommitted producers in that window through the main read.
-- An unbounded `B` degenerates to today's minimum-uncommitted-begin strategy.
-
-The behavioral parameter is required, but its configuration surface is not
-specified here. It need not be persisted in a checkpoint and MUST be applied
-consistently within a Slice session.
 
 Each recovered producer is classified as follows:
 
 | Checkpoint entry | Classification |
 |---|---|
 | Committed offset `-O` | Normal, with `last_commit` and committed end `O` recovered as today. |
-| Uncommitted begin `F`, where `F >= R` | Normal. The main read encounters the span from its beginning. |
-| Uncommitted begin `F`, where `F < R` | Gapped. The main read skips `[F, R)`. |
+| Uncommitted begin `F == M` | Normal. The main read encounters the span from its beginning. |
+| Uncommitted begin `F`, where `F < M` | Gapped. The main read skips `[F, M)`. |
 
 Because `M` is the maximum magnitude, an uncommitted `F > M` is impossible.
 
 An entry with `offset == 0` may be a hint-only producer or a real span that
-began at journal offset zero. When `R > 0`, it is gapped with `F = 0`. A later
+began at journal offset zero. When `M > 0`, it is gapped with `F = 0`. A later
 commit may therefore require a targeted read from the beginning of the
 journal. This is no worse than today's conservative restart from zero.
 
@@ -137,9 +124,12 @@ at offset zero can also carry a non-zero `hinted_commit`, and Frontier reduction
 erases whether an offset-zero entry came only from a hint or also from committed
 state. Classifying apparent hint-only entries as normal would therefore risk
 skipping a real span. The conservative `F = 0` classification is deliberate.
-Although `[0, R)` is often dead weight for a true hint-only producer, the full
-range continues through `ack_begin` and recovers any CONTINUE documents that
-the main read suppressed in `[R, ack_begin)`.
+Although `[0, M)` is often dead weight for a true hint-only producer, that cost
+is paid only if the producer later emits a real document (the trigger); the
+backfill of `[0, trigger.begin)` then recovers its whole span, reading each byte
+once. Nothing is re-read: the main read never sequences a gapped producer's
+documents, so `[M, trigger.begin)` is scanned only by the backfill and the
+trigger onward only by the main read.
 
 The journal write head MUST NOT be used in place of `M`. Bytes between a
 checkpoint-derived position and the write head may contain transactions that
@@ -147,19 +137,19 @@ no prior session sequenced.
 
 ### Why skip-ahead is safe
 
-Consider an entry relative to `M` and `R`:
+Consider an entry relative to `M`:
 
 - A committed end `O <= M` needs no replay. If this producer had an unseen
   document in `(O, M)`, checkpoint closure would require its entry to reflect
   that document as either a later commit or an uncommitted begin.
-- An uncommitted begin `F >= R` is encountered from its first document by the
+- An uncommitted begin `F == M` is encountered from its first document by the
   main read.
-- An uncommitted begin `F < R` is the only case where documents are skipped.
+- An uncommitted begin `F < M` is the only case where documents are skipped.
   The exact missing lower bound is retained as gap start `F`.
 
 The argument remains inductive across later sessions because a gapped
 producer is frozen and omitted from progress until it resolves. Other
-producers may advance the checkpoint and increase a future `M` and `R`, but the
+producers may advance the checkpoint and increase a future `M`, but the
 gapped producer continues to pin its original `F`.
 
 ## Producer state machine
@@ -167,11 +157,18 @@ gapped producer continues to pin its original `F`.
 A producer is in one of three states:
 
 ```text
-normal  -> gapped       only during checkpoint recovery
-gapped -> normal        on clean/deep rollback or a newer OUTSIDE commit
-gapped -> backfilling   on a newer committing ACK
-backfilling -> normal   after the shelved ACK commits
+normal  -> gapped        only during checkpoint recovery
+gapped -> normal         on clean/deep rollback or a newer OUTSIDE commit
+gapped -> backfilling    on the first newer non-duplicate document (CONTINUE or ACK)
+backfilling -> normal    when the historical read completes — i.e. BEFORE the
+                         trigger itself commits, for a CONTINUE or ACK trigger alike
 ```
+
+The `backfilling -> normal` transition happens at historical-read completion,
+not at commit: the reconstructed open span is installed, the gap is removed, and
+the parked trigger is handed back to the normal read path. The trigger then
+extends the span (CONTINUE) or commits it (ACK) as an ordinary main-read
+document.
 
 Session failure discards in-memory transitions. Recovery reconstructs the
 appropriate state from the last durable checkpoint.
@@ -198,24 +195,29 @@ the same `last_commit` and `F`. Requiring complete absence would unnecessarily
 constrain how live backfill sequencing state is represented. Only advancement
 or visibility is forbidden before resolution.
 
-In particular, a suppressed `ContinueBeginSpan` MUST NOT overwrite `F` with a
-post-`R` document offset.
-
 ### Main-read outcomes while gapped
 
 The following table is normative. “Commit progress” means setting a committed
 negative offset, extracting causal hints when the document is an ACK, and
 causing a flush through the normal commit path.
 
-| Document | Sequencing classification with frozen state | Required behavior |
-|---|---|---|
-| CONTINUE, clock `> last_commit` | `ContinueBeginSpan` | Suppress without state mutation. |
-| CONTINUE, clock `<= last_commit` | `ContinueDuplicate` | Drop. |
-| ACK, clock `> last_commit` | `AckEmpty` | Park at the ACK and begin backfill. Do not apply the speculative `AckEmpty` state. |
-| ACK, clock `== last_commit` | `AckDuplicate` | Resolve as a clean rollback: discard the gap and emit commit progress with `offset = -ack_end`. Extract causal hints and flush. |
-| ACK, clock `< last_commit` | `AckDuplicate` | Resolve directly as a deep rollback, without backfill: discard the gap, warn, set live `last_commit` to the ACK clock, set `offset = -ack_end`, extract causal hints, and flush. |
-| OUTSIDE, clock `> last_commit` | `OutsideCommit` | Discard the gap, then process the OUTSIDE commit normally. |
-| OUTSIDE, clock `<= last_commit` | `OutsideDuplicate` | Drop and retain the gap. |
+| Document | Required behavior |
+|---|---|
+| CONTINUE or ACK, clock `> last_commit` | Park the main read at this document (the *trigger*) and begin a backfill of `[F, trigger.begin)`. The trigger is not sequenced now; it is re-presented to the normal read path when the backfill completes. |
+| CONTINUE, clock `<= last_commit` | Drop (duplicate) and retain the gap. |
+| ACK, clock `== last_commit` | Resolve as a clean rollback: discard the gap and emit commit progress with `offset = -ack_end`. Extract causal hints and flush. No historical I/O. |
+| ACK, clock `< last_commit` | Resolve directly as a deep rollback, without backfill: discard the gap, warn, set live `last_commit` to the ACK clock, set `offset = -ack_end`, extract causal hints, and flush. |
+| OUTSIDE, clock `> last_commit` | Discard the gap, then process the OUTSIDE commit normally. No historical I/O. |
+| OUTSIDE, clock `<= last_commit` | Drop and retain the gap. |
+
+A gapped producer's frozen `max_continue = 0` makes ordinary `uuid::sequence`
+misclassify these rows (rollbacks look like `AckDuplicate`, a newer CONTINUE
+looks like `ContinueBeginSpan`), so a gapped document is classified by this
+table rather than by the normal sequencer. A newer CONTINUE and a newer ACK are
+deliberately merged into one trigger row: any live document voids the
+presumption that the producer is dead, and for a CONTINUE the producer's
+remaining span and committing ACK are almost certainly just ahead in the
+journal.
 
 Treating `ACK == last_commit` as ordinary `AckDuplicate` is insufficient: it
 would clear only in-memory state while leaving positive offset `F` in the
@@ -245,13 +247,16 @@ otherwise produce.
 
 ### Trigger and parking
 
-The first ACK with `clock > last_commit` encountered for a gapped producer is
-the trigger.
+The first newer document (a CONTINUE or ACK with `clock > last_commit`)
+encountered for a gapped producer is the *trigger*. Both kinds trigger the same
+backfill: a live document of any kind voids the presumption that the producer is
+permanently dead, and for a CONTINUE the producer's remaining span and
+committing ACK are almost certainly already in the journal just ahead.
 
-The main read MUST park at the ACK before sequencing it:
+The main read MUST park at the trigger before sequencing it:
 
-- the ACK document and metadata are retained;
-- the logical main-read position does not advance past the ACK;
+- the trigger document and metadata are retained;
+- the logical main-read position does not advance past the trigger;
 - no later document of that journal is processed; and
 - at most one backfill is active for a `(binding, journal)` read.
 
@@ -265,10 +270,15 @@ back-pressure and flush coordination.
 
 ### Historical range
 
-Backfill reads the half-open range `[F, ack_begin)` from the same journal and
-binding as the main read. It uses the binding's normal authorization,
+Backfill reads the half-open range `[F, trigger.begin)` from the same journal
+and binding as the main read. It uses the binding's normal authorization,
 `begin_mod_time`, schema validation, partition filtering, and journal routing.
 Fragments may be fetched from cold storage.
+
+This range is read exactly once, and the main read reads everything from the
+trigger onward exactly once — the two ranges are disjoint. This is a strict I/O
+improvement over a design that suppresses a gapped producer's post-`M`
+main-read CONTINUEs and then re-reads `[M, trigger.begin)` in the backfill.
 
 Every decoded document is inspected for its producer identity. Documents of
 other producers are skipped without sequencing, state mutation, key
@@ -281,41 +291,57 @@ normal path against live producer state initialized from the recovered
 
 ### One-transaction invariant
 
-The historical range reconstructs one pending source transaction:
+The historical range reconstructs one open (uncommitted) source transaction and
+holds no committing transaction boundary:
 
-- any state-changing ACK below `R` would already be reflected by checkpoint
+- any state-changing ACK below `M` would already be reflected by checkpoint
   closure;
-- clean and deep rollback ACKs encountered at or above `R` resolve directly;
-- the first committing ACK above `last_commit` at or above `R` is the parked
-  trigger; and
-- therefore no distinct transaction boundary can occur inside
-  `[F, ack_begin)`.
+- the trigger is the first target-producer document the main read reaches at or
+  above `M`, so `[M, trigger.begin)` contains no target-producer document at
+  all; and
+- therefore no committing document can occur inside `[F, trigger.begin)`.
 
 The range may contain at-least-once duplicates, which normal sequencing drops.
-A distinct target-producer transaction boundary inside the range contradicts
-the recovered checkpoint and is a terminal consistency error rather than an
-intermediate transaction to expose.
+A committing document inside the range contradicts the recovered checkpoint and
+is a terminal consistency error rather than an intermediate transaction to
+expose.
 
 ### Completion
 
-After the historical range reaches `ack_begin`:
+Completion commits nothing. After the historical range reaches `trigger.begin`:
 
-1. The shelved ACK is sequenced against the reconstructed producer state.
-2. Its causal hints are extracted normally.
-3. The producer offset becomes `-ack_end`.
-4. A flush makes all backfilled appends, producer progress, and causal hints
-   durable together.
-5. The gap is removed and the producer becomes normal.
-6. The main read resumes strictly after the ACK.
+1. The reconstructed producer state (`live`) is installed into the read's
+   pending map as the recovered open span.
+2. The gap is removed; the producer is now normal.
+3. The parked trigger is re-presented to the ready heap with its head document
+   unconsumed.
 
-The expected ACK outcome is `AckCommit`. `AckEmpty` is possible only when
+The drain loop then re-pops the trigger and sequences it through the wholly
+normal path. Because the producer is no longer gapped and its pending state is
+the reconstructed open span:
+
+- a CONTINUE trigger sequences as `ContinueExtendSpan` (or `ContinueBeginSpan`
+  when the backfill found nothing) and appends; and
+- an ACK trigger sequences as `AckCommit` and commits — causal hints, committed
+  offset, and flush — through the existing normal-path code.
+
+Installing `live` is safe, and is why there is no longer an atomic visibility
+boundary to enforce. `live.offset` is the span begin `F`, identical to what the
+durable checkpoint already records, so a flush carrying it changes nothing
+durably. (On fragment loss the first found document begins at `F' > F`; if that
+`F'` leaks to a durable base and the session then crashes, recovery re-gaps at
+`F'`, and `[F, F')` was unreadable anyway — self-consistent.) An open
+uncommitted span is a state every existing mechanism already handles: visibility
+stays gated by the absence of an ACK, exactly as for any normal mid-span
+producer. A crash any time before the eventual ACK flush recovers the unchanged
+positive `F`, re-creates the gap, and repeats idempotently.
+
+An empty reconstructed span (no target CONTINUEs found) is possible only when
 historical documents were unavailable or filtered by existing journal-read
-semantics; that exposure is addressed under accepted risks.
-
-No target-producer checkpoint advancement or transaction visibility is emitted
-between the trigger and the final ACK flush. An unchanged `(last_commit, F)`
-entry may be included by an unrelated flush. The final ACK flush remains the
-atomic visibility boundary of the backfill.
+semantics, or benignly for a hint-only producer backfilled from `F = 0`; the
+completion event reports it as `span_empty`. Under a CONTINUE trigger the
+re-presented document then sequences as `ContinueBeginSpan` and the span simply
+begins at the trigger.
 
 ## Ordering and scheduling
 
@@ -330,11 +356,14 @@ not attempt to restore global ordering across that boundary.
 This relaxation is safe because:
 
 - downstream processing does not require global producer-clock order;
-- the complete backfilled source transaction becomes visible atomically in
-  one Frontier;
+- the recovered source transaction becomes visible atomically only when its
+  committing ACK is sequenced by the normal path — inherited ACK-gated
+  visibility, not a special boundary;
 - causal hints continue to gate cross-journal transaction visibility; and
-- strict order for the target `(binding, journal, producer)` is preserved by
-  suppressing its main-read documents and parking at its ACK.
+- strict order for the target `(binding, journal, producer)` is preserved: its
+  main-read documents below the trigger are skipped, the backfill appends
+  `[F, trigger.begin)` in journal order, and the re-presented trigger then
+  continues in order from `trigger.begin` onward.
 
 The relaxation is nevertheless user-visible. An old backfilled document may be
 processed after a newer same-key document written by another producer. A
@@ -343,10 +372,19 @@ later update supersedes it. Downstream consumers are required to tolerate this
 cross-producer inversion; source-transaction atomicity, not global value order,
 is the guarantee retained by this design.
 
-When a backfill document is ready, it retains the binding's normal priority
-and read-delay metadata and follows the normal append path. Normal clock-delay
-gating still applies to its adjusted clock; implementations MUST NOT assume
-that every historical clock plus `read_delay` is already in the past.
+Backfilled documents are appended directly as an atomic sequence, without
+participating in the ready-heap ordering or the normal clock-delay gate. This
+is justified as follows. The trigger document is sequenced only after it clears
+the clock-delay gate — that is the definitive evidence used to begin backfill.
+Every CONTINUE in `[F, trigger.begin)` shares the trigger's binding, hence its
+`read_delay`, and per-producer clocks are strictly ascending, so each
+historical document's clock is strictly below the trigger's. Its adjusted clock
+(`clock + read_delay`) is therefore already in the past whenever the trigger's
+is. Priority is likewise identical across the binding. Heap ordering, priority
+ordering, and clock-delay gating are thus provable no-ops for backfilled
+documents, and an implementation MAY append them directly, provided all such
+appends precede the re-presented trigger's own append or commit on each shard
+log.
 
 The parked main read and pending historical read MUST both be exempt from the
 Slice condition that every pending read be tailing before the ready heap can
@@ -368,27 +406,33 @@ During backfill:
 - `bytes_read_delta` and `bytes_behind_delta` continue to describe only the
   forward main read; and
 - all physical bytes fetched by the historical read, including bytes skipped
-  for other producers, are counted by dedicated backfill metrics.
+  for other producers, are folded into the aggregate `bytes_read` counter but
+  never into the forward-read Frontier deltas.
 
-After the shelved ACK is consumed, the main read advances normally to
-`ack_end`.
+After the re-presented trigger is consumed by the normal path, the main read's
+`read_offset` advances to the trigger's end offset, and the main read continues
+past it.
 
 ## Causal hints and recovery checkpoints
 
 An unresolved hint (`hinted_commit > last_commit`) needs no special replay
-path. If the hinted producer is gapped, the target journal reaches its
-committing ACK, triggers backfill, and resolves the hint through the final
-atomic Frontier.
+path. If the hinted producer is gapped, the target journal reaches a newer
+document, triggers a backfill, and — once the backfill completes and the
+re-presented ACK is sequenced by the normal path — resolves the hint through the
+ordinary commit Frontier, exactly as a live ACK would. Hints are therefore
+extracted by the normal path when the ACK is consumed, not by any backfill-
+specific code.
 
-The parked ACK cannot have been fully sequenced by a prior checkpoint;
-otherwise its `last_commit` would already reflect it. The existing checkpoint
-peek mechanism remains unchanged.
+The trigger cannot have been fully sequenced by a prior checkpoint; otherwise
+its `last_commit` would already reflect it. The existing checkpoint peek
+mechanism remains unchanged.
 
-If a session ends before the final ACK flush, no progress for the backfilling
-producer has been exposed. The next session recovers the unchanged positive
-offset `F`, recreates the gap, and encounters the ACK again. Appends belonging
-only to the failed session are discarded under the existing fail-fast log
-model.
+If a session ends before the trigger's eventual commit flush, no committed
+progress for the backfilling producer has been exposed — an interim flush can
+carry only the unchanged open span at `F`. The next session recovers the
+positive offset `F`, recreates the gap, and encounters the trigger again.
+Appends belonging only to the failed session are discarded under the existing
+fail-fast log model.
 
 Unrelated producer progress may, independently, have advanced the durable
 checkpoint while the backfill was running. That does not alter the gapped
@@ -411,14 +455,16 @@ listing appearance is a new read and may start without the removed read's
 producer checkpoint. Because deletion and FULL suspension imply that no
 fragments remain, the new read has no historical span to recover.
 
-Observability gauges MUST be decremented when either a session or an
-individual read releases its gaps.
+A discarded read's in-memory `gaps` are left inert rather than actively
+cleared: the read is never re-served (its slot is not reused) and nothing
+downstream consumes them. Only an active backfill needs teardown, so that its
+parked main read and in-flight historical read are released.
 
 ### Failure handling
 
 Terminal historical-read, decoding, validation, sequencing, append, or flush
 errors follow the existing fail-fast topology teardown. Transient journal I/O
-uses the existing retry model. The main ACK remains unsequenced until the
+uses the existing retry model. The parked trigger remains unsequenced until the
 backfill completes successfully.
 
 ## Pruning
@@ -442,44 +488,77 @@ is outside this work.
 
 ## Observability
 
+The structured events are the primary observability surface. Metrics are kept
+to a deliberately small set: per-occurrence detail belongs in events, and each
+metric is a tracked series that should earn its place.
+
 Events SHOULD identify the session, binding, journal, and producer and MUST
 avoid document content.
 
 Required events are:
 
-- gap creation, with `F`, `M`, `R`, and configured bound `B`;
-- backfill trigger, with `F` and `ack_begin`;
-- backfill completion, with range bytes, physical bytes read, and duration;
+- gap creation, with `F` and `M`;
+- backfill trigger, with `F`, `trigger_begin`, and whether the trigger is an ACK;
+- backfill completion, with range bytes, physical bytes read, duration, and
+  `span_empty` (a fragment-loss indicator, also benign for a hint-only producer
+  backfilled from `F = 0`);
 - gap resolution by clean or deep rollback, including which outcome occurred
   and confirmation that no historical I/O was issued;
-- gap resolution by OUTSIDE;
-- gap release because its read or session ended; and
-- backfill failure, with the phase and error.
+- gap resolution by OUTSIDE; and
+- a backfill stopped by journal removal, reported as a benign stop.
+
+Terminal backfill errors (read, decode, validation, sequencing, append, or
+flush) get no dedicated event: they fail-fast into the existing session
+teardown, which is itself the signal.
 
 Required metrics are:
 
-- gauge of unresolved gapped producers per Slice, including gaps currently
-  backfilling until their final ACK is flushed;
-- counters of backfills started, completed, and failed;
-- counter of physical backfill bytes read; and
-- histogram of backfill duration and requested range size.
+- counter of backfills started; and
+- counter of backfills stopped: the historical read completed (the trigger was
+  re-presented), a benign journal removal stopped the backfill as an EOF stops a
+  main read, or the session tore down while the backfill was in flight (counted
+  on drop). `started - stopped`
+  is the live in-flight count, deriving that gauge without gauge maintenance and
+  mirroring the read `started` / `stopped` pair.
 
-Restart-resolution metrics SHOULD also report bytes conservatively re-read
-(`M - R`) and counts of near-frontier producers recovered normally versus
-far producers classified as gapped. These measurements inform production
-tuning of `B`.
+The count of uncommitted producers classified as gapped on restart is not
+tracked as a metric; the per-producer gap-creation event (with `F` and `M`)
+already records each occurrence.
 
-Existing forward-read and bytes-behind metrics MUST remain monotonic and MUST
-exclude historical backfill I/O.
+Physical bytes fetched by historical reads are folded into the existing
+`bytes_read` counter rather than tracked as a separate series.
+
+The forward-read Frontier deltas (`bytes_read_delta`, `bytes_behind_delta`)
+MUST remain monotonic and describe only forward main-read progress; they
+exclude historical backfill I/O even though the aggregate `bytes_read` counter
+includes it.
 
 ## Accepted risks and explicit non-goals
 
 ### Historical fragment loss
 
-If fragments covering part of `[F, ack_begin)` have expired, a Gazette read may
-fast-forward over the hole. The final ACK can then commit a partial span. This
-is the same exposure as today's conservative read and remains accepted. The
-event and byte metrics must make a suspiciously short backfill diagnosable.
+If fragments covering part of `[F, trigger.begin)` have expired, a Gazette read
+may fast-forward over the hole. The eventual ACK can then commit a partial span.
+This is the same exposure as today's conservative read and remains accepted. The
+`span_empty` event flag and the byte metrics must make a suspiciously short
+backfill diagnosable.
+
+### Wasted backfill on a post-`M` rollback
+
+A resumed producer that reopens and then *rolls back* its span above `M` still
+triggers a backfill (the reopening CONTINUE is a newer document), whose work is
+discarded when the rollback ACK is later sequenced. This is rare: normal Gazette
+producer recovery writes its rollback ACK first, and that ACK — at or below
+`last_commit` — hits the zero-I/O clean-rollback row before any CONTINUE
+reopens a span. Accepted rather than special-cased.
+
+### Uncommitted appends before commit certainty
+
+Backfilled CONTINUE documents occupy shard logs before their transaction's
+commit is certain, since completion installs the open span and appends its
+documents ahead of the trigger's eventual ACK. This is the same exposure as any
+live open span a Slice reads in real time, and the disk-limit bound below
+applies identically.
 
 ### Zombie commit after pruning
 
@@ -497,8 +576,8 @@ solve it.
 ### Parked journal
 
 The triggering journal makes no forward progress while historical data is
-read. This cost is paid only when a tracked producer actually commits and is
-bounded by `[F, ack_begin)`.
+read. This cost is paid only when a tracked producer emits a newer document and
+is bounded by `[F, trigger.begin)`.
 
 ### Global priority order
 
@@ -512,7 +591,7 @@ arrives.
 ### Persisted journal watermark
 
 No per-journal read watermark is added to the checkpoint. If the only recorded
-event is the open span itself, then `M == R == F` and restart remains
+event is the open span itself, then `M == F` and restart remains
 conservative. A persisted watermark could improve that case but requires
 protocol and persistence changes.
 
@@ -530,20 +609,29 @@ hold:
    checkpoint-derived position; every skipped gapped span is recovered before
    a committing ACK is sequenced, or is durably discarded by rollback or a
    newer OUTSIDE commit.
-2. **Exactly-once delivery is preserved.** Main-read documents of a gapped
-   producer are suppressed, and the main read resumes after the ACK, so the
-   backfill is the only append path for the recovered span.
-3. **Producer order is preserved.** Historical documents are appended in
-   journal order before the ACK, while later main-read documents remain parked.
-4. **Transaction visibility is atomic.** No producer checkpoint advancement is
-   emitted until every recovered append is flushed with the committing ACK and
-   causal hints. Unchanged producer state in an unrelated Frontier is harmless.
+2. **Exactly-once delivery is preserved.** The recovered span's appends split
+   across two disjoint ranges — the backfill covers `[F, trigger.begin)` and the
+   main read covers the trigger onward. A gapped producer's main-read documents
+   below the trigger are never sequenced, and per-producer sequencing drops any
+   at-least-once duplicate across the boundary, so each document appends once.
+3. **Producer order is preserved.** Historical documents are appended in journal
+   order while later main-read documents remain parked; the re-presented trigger
+   then continues strictly from `trigger.begin`.
+4. **Transaction visibility is atomic — inherited from normal operation.** The
+   backfill installs only the open span (offset `F`), which advances no
+   visibility. The transaction becomes visible only when the re-presented ACK
+   commits through the ordinary path, flushing every recovered append with the
+   committing progress and causal hints together — the same ACK-gated atomicity
+   as any live transaction. An interim flush carrying the unchanged open span is
+   harmless.
 5. **Rollback is durable.** An ACK at or below `last_commit` replaces positive
    `F` with committed `-ack_end`, so the gap does not return after restart.
    Deep rollback retains existing monotonic Frontier-reduction semantics for
    `last_commit`.
-6. **Recovery is idempotent.** Failure before the final flush reconstructs the
-   same gap and safely repeats the historical read in a new, empty log session.
+6. **Recovery is idempotent.** Failure before the trigger's eventual commit
+   flush reconstructs the same gap (an interim flush can only carry the unchanged
+   open span at `F`) and safely repeats the historical read in a new, empty log
+   session.
 7. **Main-read progress is coherent.** Historical offsets never regress or
    inflate forward-read checkpoint metrics.
 
@@ -560,22 +648,27 @@ generator must add sessions in which:
 - the gapped producer deeply rolls back below `last_commit`, resolving without
   historical I/O;
 - the gapped producer writes a newer OUTSIDE document;
-- multiple live producers have clustered open spans in one journal, under both
-  `B = 0` and a non-zero bounded re-read;
+- multiple live producers have clustered open spans in one journal;
 - multiple far-behind producers are gapped in one journal;
 - a gapped transaction spans multiple journals and resolves causal hints; and
 - teardown occurs before trigger handling, during historical I/O, after
-  historical appends, and before the final flush completes.
+  historical appends, and before the trigger's commit flush completes.
 
 Deterministic coverage must additionally verify:
 
-- `M`, `R`, and `B` resolution and gap classification, including `B = 0`, an
-  unbounded `B`, and `offset == 0`;
+- `M` resolution and gap classification, including `offset == 0`;
 - the complete gapped outcome table;
+- a CONTINUE-triggered backfill that later commits via the main-read ACK;
+- an ACK-triggered backfill (all CONTINUEs below `M`) that commits when the
+  trigger is re-presented on completion;
+- an empty backfill under a CONTINUE trigger reports `span_empty` and the span
+  begins at the trigger;
+- a flush landing between completion and the parked trigger's consumption leaves
+  durable state at the recovered `(last_commit, F)`;
 - durable rollback followed immediately by restart;
 - deep rollback while gapped clears the gap without a backfill and preserves
   monotonic reduced-Frontier semantics;
-- rejection of a distinct intermediate target-producer ACK in a backfill;
+- rejection of a committing document inside a backfill's historical range;
 - neither a parked main read nor a cold historical read engages the
   all-reads-tailing drain gate or ordinary stalled-read accounting;
 - global priority/adjusted-clock inversion is tolerated for a backfill while
@@ -583,16 +676,13 @@ Deterministic coverage must additionally verify:
 - FULL suspension releases gap state after fragments are gone, and a later
   appearance starts fresh;
 - an ambiguous hinted producer with `offset == 0` is conservatively backfilled
-  from zero and commits its post-`R` suppressed span;
-- clustered live producers within `B` are recovered in one main-read pass, with
-  conservative re-read bounded by `B`, rather than serialized backfills;
+  from zero and commits its post-`M` skipped span;
 - main-read byte deltas remain monotonic and exclude physical backfill bytes;
 - backfill trigger and completion interact correctly with `recovery_pending`
   and the first checkpoint's peek/gating; and
 - backfill retry and cancellation release all parked state cleanly.
 
-Acceptance requires the dominant stale-producer case to start within `B` bytes
-of the fresh checkpoint maximum rather than at the old span begin. A later
+Acceptance requires the dominant stale-producer case to start at the fresh
+checkpoint maximum rather than at the old span begin. A later
 commit must still deliver the complete source transaction exactly once, while
-clean and deep rollback perform no historical I/O. With `B = 0`, the maximum
-offset path and all applicable backfill transitions must be fully exercised.
+clean and deep rollback perform no historical I/O.

@@ -1,4 +1,3 @@
-use super::gap::GapState;
 use super::producer::ProducerState;
 use super::read::ReadState;
 use crate::ProducerMap;
@@ -25,9 +24,6 @@ pub struct Topology {
     pub journal_clients: Vec<super::LazyJournalClient>,
     /// Sorted index for projecting hinted journal names to bindings.
     pub hint_index: HintIndex,
-    /// Near-frontier conservative re-read bound "B", in bytes. Applied
-    /// consistently to every read the Slice resolves this session.
-    pub reread_bound_bytes: u64,
 }
 
 /// Flush cycle state machine, tracking in-flight flushes to Log shards.
@@ -249,50 +245,45 @@ pub fn clock_delay(
 /// recovered producer state, and any gapped producers.
 #[derive(Debug)]
 pub struct ResolvedCheckpoint {
-    /// `R`: the journal offset at which the main read starts.
+    /// `M`: the journal offset at which the main read starts, the maximum
+    /// offset magnitude across all producer entries.
     pub offset: i64,
     /// Recovered producer states, all entries included (gapped ones frozen
     /// as-is). This becomes the read's `settled` map.
     pub producers: ProducerMap<ProducerState>,
-    /// Producers classified as gapped: an uncommitted begin `F < R`.
-    pub gaps: ProducerMap<GapState>,
-    /// `M`: the maximum offset magnitude across all producer entries.
-    pub max_offset: i64,
+    /// Producers classified as gapped, mapped to their pinned uncommitted begin
+    /// offset `F` (`F < M`).
+    pub gaps: ProducerMap<i64>,
 }
 
 /// Resolve a StartRead's checkpoint into a start offset, recovered producer
 /// state, and gapped producers, per `plans/shuffle-gapped-restart.md`
 /// §Restart resolution.
 ///
-/// Let `M = max(|offset|)` across all entries (0 for an empty checkpoint), and
-/// `B = reread_bound_bytes`. The main read starts at
-/// `R = min({M} ∪ {F : F uncommitted ∧ M - F <= B})`, re-reading at most `B`
-/// bytes behind `M`. Each uncommitted span whose begin `F < R` begins before
-/// that window and is *gapped*: the main read skips `[F, R)` and the producer
-/// is frozen at `F` until a later document resolves it. Committed entries and
-/// uncommitted spans with `F >= R` are recovered normally.
+/// The main read starts at `M = max(|offset|)` across all entries (0 for an
+/// empty checkpoint) — the furthest position the checkpoint justifies. Each
+/// uncommitted span whose begin `F < M` is *gapped*: the main read skips
+/// `[F, M)` and the producer is frozen at `F` until a later document resolves
+/// it. Committed entries and an uncommitted span with `F == M` are recovered
+/// normally.
 ///
 /// An `offset == 0` entry (a real span at journal start, or a hint-only
 /// producer that Frontier reduction has made indistinguishable) is gapped at
-/// `F = 0` whenever `R > 0`. This is deliberately conservative: classifying it
-/// as normal would risk skipping a real span. It's no worse than today's
-/// conservative restart from zero.
+/// `F = 0` whenever `M > 0`. This is deliberately conservative: classifying it
+/// as normal would risk skipping a real span, and a later backfill from zero
+/// is no worse than a conservative restart from zero.
 ///
 /// The journal write head is never consulted in place of `M`: bytes between a
 /// checkpoint-derived position and the write head may contain transactions no
 /// prior session sequenced.
-pub fn resolve_checkpoint(
-    checkpoint: Vec<shuffle::ProducerFrontier>,
-    reread_bound_bytes: u64,
-) -> ResolvedCheckpoint {
+pub fn resolve_checkpoint(checkpoint: Vec<shuffle::ProducerFrontier>) -> ResolvedCheckpoint {
     let mut producers = ProducerMap::<ProducerState>::with_capacity_and_hasher(
         checkpoint.len(),
         Default::default(),
     );
 
-    // First pass: recover producer states and compute M and the resolved R.
+    // First pass: recover producer states and compute M.
     let mut max_offset = 0i64; // M
-    let mut resolved = i64::MAX; // R candidate: min of qualifying uncommitted F.
 
     for frontier in checkpoint {
         let shuffle::ProducerFrontier {
@@ -317,34 +308,19 @@ pub fn resolve_checkpoint(
         );
     }
 
-    // Second pass over producers to find R now that M is known: the minimum
-    // uncommitted begin within B bytes of M (else M itself). `M - F` is
-    // non-negative because M is the maximum magnitude.
-    for ps in producers.values() {
-        if ps.offset >= 0 && (max_offset - ps.offset) as u64 <= reread_bound_bytes {
-            resolved = resolved.min(ps.offset);
-        }
-    }
-    let offset = resolved.min(max_offset); // R.
-
-    // Third pass: classify uncommitted spans beginning before R as gapped.
-    let mut gaps = ProducerMap::<GapState>::with_capacity_and_hasher(0, Default::default());
+    // Second pass: classify uncommitted spans beginning before M as gapped,
+    // pinning each producer's begin offset F.
+    let mut gaps = ProducerMap::<i64>::with_capacity_and_hasher(0, Default::default());
     for (producer, ps) in producers.iter() {
-        if ps.offset >= 0 && ps.offset < offset {
-            gaps.insert(
-                *producer,
-                GapState::Gapped {
-                    gap_begin: ps.offset,
-                },
-            );
+        if ps.offset >= 0 && ps.offset < max_offset {
+            gaps.insert(*producer, ps.offset);
         }
     }
 
     ResolvedCheckpoint {
-        offset,
+        offset: max_offset,
         producers,
         gaps,
-        max_offset,
     }
 }
 
@@ -354,15 +330,16 @@ pub fn resolve_checkpoint(
 /// A gapped producer's frozen `max_continue == 0` makes `uuid::sequence`
 /// misclassify the rollback rows as `AckDuplicate`, so gapped documents are
 /// classified here instead of through `sequence_document`.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GappedOutcome {
-    /// CONTINUE with `clock > last_commit`: suppress, with no state mutation
-    /// and no append. The pinned `F` must not be overwritten.
-    Suppress,
     /// A duplicate at or below `last_commit` (CONTINUE or OUTSIDE): drop and
     /// retain the gap.
     Drop,
-    /// ACK with `clock > last_commit`: park the main read and begin backfill.
+    /// The first newer document (CONTINUE or ACK, `clock > last_commit`): park
+    /// the main read at it and begin a backfill of `[F, trigger.begin)`. A live
+    /// document of any kind voids the presumption that a gapped producer is
+    /// permanently dead; for a CONTINUE trigger the producer's remaining span
+    /// and ACK are almost certainly just ahead in the journal.
     TriggerBackfill,
     /// ACK with `clock == last_commit`: durable clean rollback. Discard the
     /// gap and emit committed progress `offset = -ack_end`.
@@ -392,7 +369,10 @@ pub fn sequence_gapped(gap_last_commit: uuid::Clock, meta: &super::read::Meta) -
         }
     } else if flags.is_continue() {
         if *clock > gap_last_commit {
-            GappedOutcome::Suppress
+            // A newer CONTINUE voids the presumption that the producer is dead,
+            // exactly as a newer ACK does: trigger a backfill. The producer's
+            // committing ACK is almost certainly just ahead in the journal.
+            GappedOutcome::TriggerBackfill
         } else {
             GappedOutcome::Drop
         }
@@ -408,23 +388,98 @@ pub fn sequence_gapped(gap_last_commit: uuid::Clock, meta: &super::read::Meta) -
     }
 }
 
-/// Speculatively sequence a document against current producer state.
+/// Pure sequencing outcome of a main-read document, unifying the normal and
+/// gapped-producer paths into one POD result the caller acts on. Keeping the
+/// decision pure (no state or gap mutation) is what makes the caller's post-pop
+/// retry safe: a document re-sequenced after a full Log channel re-derives the
+/// identical outcome.
+#[derive(Debug)]
+pub enum Sequenced {
+    /// Consume the head document with these effects. `gapped` carries the
+    /// gapped-producer classification when the producer was gapped, so the
+    /// caller can resolve the gap and report the outcome.
+    Doc {
+        doc: SequencedDoc,
+        gapped: Option<GappedOutcome>,
+    },
+    /// A gapped producer's first newer document (CONTINUE or ACK, `clock >
+    /// last_commit`): the caller parks the main read at it and begins a backfill
+    /// of `[F, trigger.begin)`. The trigger is NOT sequenced now; when the
+    /// backfill completes it is re-presented to the ready heap and sequenced
+    /// through the wholly-normal path against the reconstructed span.
+    Park,
+}
+
+/// Speculatively sequence a main-read document against the read's producer
+/// state. Pure: state is NOT modified and gaps are NOT mutated; the caller
+/// applies the outcome after successful I/O.
 ///
-/// Returns a `SequencedDoc` capturing the outcome. State is NOT modified;
-/// the caller must update producer state after successful I/O.
+/// A gapped producer's frozen `max_continue == 0` makes `uuid::sequence`
+/// misreport its rollback rows, so a gapped producer is classified by
+/// `sequence_gapped` (spec §Main-read outcomes while gapped) and its outcome is
+/// lowered into the same `SequencedDoc` the normal path produces — except the
+/// first newer document (CONTINUE or ACK), which yields `Park` to trigger a
+/// backfill instead of being sequenced now.
 pub fn sequence_document(
     read_state: &ReadState,
     binding: &crate::Binding,
     meta: &super::read::Meta,
-) -> anyhow::Result<SequencedDoc> {
-    // Query for the Producer's latest state: pending
-    // (updated since last flush) takes precedence over settled state.
+) -> anyhow::Result<Sequenced> {
+    // Query for the Producer's latest state: pending (updated since last flush)
+    // takes precedence over settled state. While gapped these are identical
+    // (the frozen recovered entry), so the same lookup serves both paths.
     let producer_state = (read_state.pending.get(&meta.producer))
         .or_else(|| read_state.settled.get(&meta.producer))
         .cloned() // This is a cheap clone.
         .unwrap_or_default();
 
-    sequence_producer(producer_state, &read_state.journal, binding, meta)
+    if !read_state.gaps.contains_key(&meta.producer) {
+        let doc = sequence_producer(producer_state, &read_state.journal, binding, meta)?;
+        return Ok(Sequenced::Doc { doc, gapped: None });
+    }
+
+    let outcome = sequence_gapped(producer_state.last_commit, meta);
+    let doc = match outcome {
+        GappedOutcome::TriggerBackfill => return Ok(Sequenced::Park),
+
+        // Drop mutates no state: a duplicate at or below `last_commit` retains
+        // the gap unchanged. The frozen entry flows through the caller's consume
+        // tail (`pending.insert`) — spec §Gapped state sanctions an unrelated
+        // flush carrying the same `(last_commit, F)`, matching how the normal
+        // path inserts unchanged state for Continue/Ack duplicates.
+        GappedOutcome::Drop => SequencedDoc {
+            is_append: false,
+            is_commit: false,
+            producer_state,
+        },
+
+        // Durable rollback: replace positive `F` with a committed `-ack_end`
+        // so the gap does not return after restart. The negative offset wins by
+        // magnitude under Frontier reduction even if a base retains a higher
+        // (monotonic) `last_commit` — matching existing deep-rollback semantics.
+        // (The caller warns on DeepRollback and clears the gap post-pop.)
+        GappedOutcome::CleanRollback | GappedOutcome::DeepRollback => SequencedDoc {
+            is_append: false,
+            is_commit: true,
+            producer_state: ProducerState {
+                last_commit: meta.clock,
+                max_continue: uuid::Clock::zero(),
+                offset: -meta.end_offset,
+            },
+        },
+
+        // A newer OUTSIDE commit resolves the gap: sequence the document
+        // normally against the frozen state (whose `max_continue == 0` lets
+        // `OutsideCommit` proceed). The caller clears the gap post-pop.
+        GappedOutcome::OutsideResolve => {
+            sequence_producer(producer_state, &read_state.journal, binding, meta)?
+        }
+    };
+
+    Ok(Sequenced::Doc {
+        doc,
+        gapped: Some(outcome),
+    })
 }
 
 /// Speculatively sequence a document against an explicit `producer_state`.
@@ -728,6 +783,15 @@ mod test {
         Producer::from_bytes([id | 0x01, 0, 0, 0, 0, 0])
     }
 
+    /// Unwrap the non-gapped `Sequenced::Doc` produced by the normal path, for
+    /// tests that don't exercise gapped classification.
+    fn seq_doc(seq: Sequenced) -> SequencedDoc {
+        match seq {
+            Sequenced::Doc { doc, gapped: None } => doc,
+            other => panic!("expected a non-gapped Doc, got {other:?}"),
+        }
+    }
+
     /// Build a checkpoint entry for a producer with zero clocks and a committed offset.
     /// This is the minimal "known producer" state needed by tests.
     fn checkpoint_entry(p: &Producer, committed_end: i64) -> shuffle::ProducerFrontier {
@@ -792,49 +856,43 @@ mod test {
         let p3 = producer(0x03);
         let p5 = producer(0x05);
 
-        // Empty checkpoint → M = R = 0, no gaps.
-        let r = resolve_checkpoint(vec![], 0);
-        assert_eq!((r.offset, r.max_offset), (0, 0));
+        // Empty checkpoint → M = 0, no gaps.
+        let r = resolve_checkpoint(vec![]);
+        assert_eq!(r.offset, 0);
         assert!(r.producers.is_empty() && r.gaps.is_empty());
 
-        // All committed: M = max magnitude, R = M (no uncommitted), no gaps.
-        let r = resolve_checkpoint(vec![cp(&p1, -500), cp(&p3, -1000)], 0);
-        assert_eq!((r.offset, r.max_offset), (1000, 1000));
+        // All committed: M = max magnitude, no gaps.
+        let r = resolve_checkpoint(vec![cp(&p1, -500), cp(&p3, -1000)]);
+        assert_eq!(r.offset, 1000);
         assert!(r.gaps.is_empty());
 
-        // Mixed, B = 0: R = M = 1000 (max magnitude, from the committed -1000);
-        // both uncommitted spans (300, 100) begin before R → gapped.
-        let r = resolve_checkpoint(vec![cp(&p1, -1000), cp(&p3, 300), cp(&p5, 100)], 0);
-        assert_eq!((r.offset, r.max_offset), (1000, 1000));
+        // Mixed: M = 1000 (max magnitude, from the committed -1000); both
+        // uncommitted spans (300, 100) begin before M → gapped.
+        let r = resolve_checkpoint(vec![cp(&p1, -1000), cp(&p3, 300), cp(&p5, 100)]);
+        assert_eq!(r.offset, 1000);
         assert_eq!(
             gap_summary(&r),
             vec![(-1000, false), (100, true), (300, true)]
         );
 
-        // Same checkpoint, B large enough to include the nearest uncommitted
-        // (M - 300 = 700 <= B) but not the far one (M - 100 = 900 > B): R = 300,
-        // p3 (F=300 >= R) normal, p5 (F=100 < R) gapped.
-        let r = resolve_checkpoint(vec![cp(&p1, -1000), cp(&p3, 300), cp(&p5, 100)], 700);
+        // An uncommitted span at exactly M is recovered normally: the main
+        // read encounters it from its first document.
+        let r = resolve_checkpoint(vec![cp(&p1, -300), cp(&p3, 300), cp(&p5, 100)]);
         assert_eq!(r.offset, 300);
         assert_eq!(
             gap_summary(&r),
-            vec![(-1000, false), (100, true), (300, false)]
+            vec![(-300, false), (100, true), (300, false)]
         );
 
-        // Unbounded B degenerates to min-uncommitted-begin: R = 100, no gaps.
-        let r = resolve_checkpoint(vec![cp(&p1, -1000), cp(&p3, 300), cp(&p5, 100)], u64::MAX);
-        assert_eq!(r.offset, 100);
-        assert!(r.gaps.is_empty());
-
-        // offset == 0 with R > 0 is conservatively gapped at F = 0.
-        let r = resolve_checkpoint(vec![cp(&p1, 0), cp(&p3, 500)], 0);
-        assert_eq!((r.offset, r.max_offset), (500, 500));
+        // offset == 0 with M > 0 is conservatively gapped at F = 0.
+        let r = resolve_checkpoint(vec![cp(&p1, 0), cp(&p3, 500)]);
+        assert_eq!(r.offset, 500);
         assert_eq!(gap_summary(&r), vec![(0, true), (500, false)]);
 
-        // offset == 0 with R == 0 (empty of committed/near spans) is NOT gapped:
+        // offset == 0 with M == 0 (no committed/further spans) is NOT gapped:
         // the sole span begins at journal start and the main read covers it.
-        let r = resolve_checkpoint(vec![cp(&p1, 0)], u64::MAX);
-        assert_eq!((r.offset, r.max_offset), (0, 0));
+        let r = resolve_checkpoint(vec![cp(&p1, 0)]);
+        assert_eq!(r.offset, 0);
         assert!(r.gaps.is_empty());
     }
 
@@ -847,15 +905,15 @@ mod test {
         // (flags, clock, expected) — the complete normative outcome table for a
         // gapped producer's main-read documents (spec §Main-read outcomes).
         let cases: &[(Flags, u64, GappedOutcome)] = &[
-            (CONTINUE, 150, Suppress),      // ContinueBeginSpan
-            (CONTINUE, 100, Drop),          // ContinueDuplicate (== last_commit)
-            (CONTINUE, 50, Drop),           // ContinueDuplicate (< last_commit)
-            (ACK, 150, TriggerBackfill),    // AckEmpty → park + backfill
-            (ACK, 100, CleanRollback),      // AckDuplicate → durable clean rollback
-            (ACK, 50, DeepRollback),        // AckDuplicate → durable deep rollback
-            (OUTSIDE, 150, OutsideResolve), // OutsideCommit → discard gap, reprocess
-            (OUTSIDE, 100, Drop),           // OutsideDuplicate (== last_commit)
-            (OUTSIDE, 50, Drop),            // OutsideDuplicate (< last_commit)
+            (CONTINUE, 150, TriggerBackfill), // newer CONTINUE → park + backfill
+            (CONTINUE, 100, Drop),            // ContinueDuplicate (== last_commit)
+            (CONTINUE, 50, Drop),             // ContinueDuplicate (< last_commit)
+            (ACK, 150, TriggerBackfill),      // newer ACK → park + backfill
+            (ACK, 100, CleanRollback),        // AckDuplicate → durable clean rollback
+            (ACK, 50, DeepRollback),          // AckDuplicate → durable deep rollback
+            (OUTSIDE, 150, OutsideResolve),   // OutsideCommit → discard gap, reprocess
+            (OUTSIDE, 100, Drop),             // OutsideDuplicate (== last_commit)
+            (OUTSIDE, 50, Drop),              // OutsideDuplicate (< last_commit)
         ];
         for (flags, clock, expected) in cases {
             let m = meta(p, Clock::from_u64(*clock), *flags, 0, 10);
@@ -868,6 +926,93 @@ mod test {
     }
 
     #[test]
+    fn test_sequence_document_gapped() {
+        use GappedOutcome::*;
+        let mut s = test_state(vec![test_binding(0, true, None, "/suffix")]);
+        let p = producer(0x01);
+        let p2 = producer(0x03);
+
+        // Recover `p` as gapped: its uncommitted span begins at F=50 with frozen
+        // last_commit=100 (from `cp`); p2's committed -100 raises M to 100.
+        let ResolvedCheckpoint {
+            producers, gaps, ..
+        } = resolve_checkpoint(vec![cp(&p, 50), cp(&p2, -100)]);
+        assert_eq!(gaps.get(&p), Some(&50), "p is gapped at F=50");
+        s.reads.push(ReadState {
+            binding_index: 0,
+            journal: "test/journal/A".into(),
+            settled: producers,
+            pending: Default::default(),
+            gaps,
+            read_offset: 0,
+            prev_read_offset: 0,
+            write_head: 0,
+            prev_write_head: 0,
+        });
+
+        let lc = Clock::from_u64(100);
+
+        // The complete gapped outcome table, one layer up from
+        // `test_sequence_gapped_outcome_table`: each main-read document maps to
+        // the `SequencedDoc` the caller applies (is_append/is_commit/producer_state)
+        // — or `Park` for a newer CONTINUE/ACK trigger. All use begin/end offsets
+        // (200, 210), so a rollback commits at -210.
+        let seq = |flags, clock: Clock| {
+            sequence_document(
+                &s.reads[0],
+                &s.bindings[0],
+                &meta(p, clock, flags, 200, 210),
+            )
+            .unwrap()
+        };
+        let doc = |flags, clock: Clock| match seq(flags, clock) {
+            Sequenced::Doc { doc, gapped } => (doc, gapped),
+            Sequenced::Park => panic!("expected Doc, got Park (flags={flags:?} clock={clock:?})"),
+        };
+
+        // CONTINUE / OUTSIDE duplicates at or below last_commit drop and mutate
+        // no state: the frozen entry (offset=F=50, last_commit=100) passes
+        // through unchanged, and neither appends nor commits.
+        for (flags, clock) in [(CONTINUE, 100), (OUTSIDE, 100), (OUTSIDE, 50)] {
+            let (d, g) = doc(flags, Clock::from_u64(clock));
+            assert_eq!(g, Some(Drop), "flags={flags:?} clock={clock}");
+            assert!(
+                !d.is_append && !d.is_commit,
+                "flags={flags:?} clock={clock}"
+            );
+            assert_eq!(d.producer_state.offset, 50, "frozen F preserved");
+            assert_eq!(d.producer_state.last_commit, lc, "frozen last_commit");
+        }
+
+        // Clean and deep rollback commit a durable `-ack_end`, regressing
+        // last_commit to the ACK clock; no append.
+        for (clock, outcome) in [(100, CleanRollback), (50, DeepRollback)] {
+            let (d, g) = doc(ACK, Clock::from_u64(clock));
+            assert_eq!(g, Some(outcome), "clock={clock}");
+            assert!(!d.is_append && d.is_commit, "clock={clock}");
+            assert_eq!(d.producer_state.offset, -210, "committed -ack_end");
+            assert_eq!(d.producer_state.last_commit, Clock::from_u64(clock));
+        }
+
+        // A newer OUTSIDE resolves the gap and sequences as an OutsideCommit:
+        // append + commit at -ack_end. Its clock is past the binding's
+        // `not_before` (UNIX_EPOCH) so the append isn't clock-window suppressed.
+        let (d, g) = doc(OUTSIDE, Clock::from_unix(100, 0));
+        assert_eq!(g, Some(OutsideResolve));
+        assert!(d.is_append && d.is_commit);
+        assert_eq!(d.producer_state.offset, -210);
+
+        // The first newer document — CONTINUE or ACK — parks the main read to
+        // trigger a backfill; it is re-presented to the normal path on
+        // completion rather than sequenced here.
+        assert!(matches!(
+            seq(CONTINUE, Clock::from_u64(150)),
+            Sequenced::Park
+        ));
+        assert!(matches!(seq(ACK, Clock::from_u64(150)), Sequenced::Park));
+    }
+
+    #[test]
     fn test_gapped_rollback_is_durable() {
         // A gapped clean/deep rollback emits a committed entry (offset =
         // -ack_end). Re-resolving that checkpoint must not recreate the gap
@@ -875,52 +1020,13 @@ mod test {
         let p = producer(0x01);
         let p2 = producer(0x03);
 
-        let r = resolve_checkpoint(vec![cp(&p, -450)], 0);
+        let r = resolve_checkpoint(vec![cp(&p, -450)]);
         assert!(r.gaps.is_empty(), "committed offset is never gapped");
 
-        let r = resolve_checkpoint(vec![cp(&p, -450), cp(&p2, -100_000)], 0);
+        let r = resolve_checkpoint(vec![cp(&p, -450), cp(&p2, -100_000)]);
         assert!(
             !r.gaps.contains_key(&p),
             "rolled-back producer stays committed across restart",
-        );
-    }
-
-    #[test]
-    fn test_backfill_intermediate_commit_is_detected() {
-        // The backfill drain path sequences target-producer documents against
-        // the gap's `live` state and bails when `sequence_producer` reports a
-        // commit — a distinct committing ACK inside the historical range
-        // contradicts the recovered checkpoint (spec §One-transaction invariant).
-        let binding = test_binding(0, true, None, "/suffix");
-        let p = producer(0x01);
-
-        let live = ProducerState {
-            last_commit: Clock::from_u64(100),
-            max_continue: Clock::zero(),
-            offset: 200,
-        };
-        // A CONTINUE extends the reconstructed span — not a commit.
-        let s = sequence_producer(
-            live,
-            "test/journal",
-            &binding,
-            &meta(p, Clock::from_u64(150), CONTINUE, 200, 210),
-        )
-        .unwrap();
-        assert!(!s.is_commit, "CONTINUE within the range is not a commit");
-
-        // A committing ACK within the range reports is_commit; the actor treats
-        // this as a terminal consistency error and bails.
-        let s2 = sequence_producer(
-            s.producer_state,
-            "test/journal",
-            &binding,
-            &meta(p, Clock::from_u64(150), ACK, 210, 220),
-        )
-        .unwrap();
-        assert!(
-            s2.is_commit,
-            "a committing ACK inside the range is detectable (actor bails)",
         );
     }
 
@@ -935,7 +1041,7 @@ mod test {
         let p1 = producer(0x01);
 
         // Start read with p1 in the checkpoint.
-        let producers = resolve_checkpoint(vec![checkpoint_entry(&p1, 0)], u64::MAX).producers;
+        let producers = resolve_checkpoint(vec![checkpoint_entry(&p1, 0)]).producers;
         s.reads.push(ReadState {
             binding_index: 0,
             journal: "test/journal/A".into(),
@@ -949,34 +1055,40 @@ mod test {
         });
 
         // Clock before notBefore: suppresses append but not commit.
-        let seq = sequence_document(
-            &s.reads[0],
-            &s.bindings[0],
-            &meta(p1, Clock::from_u64(50), OUTSIDE, 0, 50),
-        )
-        .unwrap();
+        let seq = seq_doc(
+            sequence_document(
+                &s.reads[0],
+                &s.bindings[0],
+                &meta(p1, Clock::from_u64(50), OUTSIDE, 0, 50),
+            )
+            .unwrap(),
+        );
         assert!(!seq.is_append, "before notBefore → no append");
         assert!(seq.is_commit, "before notBefore → commit still propagates");
         s.commit(0, p1, seq);
 
         // Clock within range: normal append.
-        let seq = sequence_document(
-            &s.reads[0],
-            &s.bindings[0],
-            &meta(p1, Clock::from_u64(200), OUTSIDE, 50, 100),
-        )
-        .unwrap();
+        let seq = seq_doc(
+            sequence_document(
+                &s.reads[0],
+                &s.bindings[0],
+                &meta(p1, Clock::from_u64(200), OUTSIDE, 50, 100),
+            )
+            .unwrap(),
+        );
         assert!(seq.is_append, "within range → append");
         assert!(seq.is_commit, "within range → commit");
         s.commit(0, p1, seq);
 
         // Clock at notAfter boundary: suppresses append (notAfter is exclusive).
-        let seq = sequence_document(
-            &s.reads[0],
-            &s.bindings[0],
-            &meta(p1, Clock::from_u64(500), OUTSIDE, 100, 150),
-        )
-        .unwrap();
+        let seq = seq_doc(
+            sequence_document(
+                &s.reads[0],
+                &s.bindings[0],
+                &meta(p1, Clock::from_u64(500), OUTSIDE, 100, 150),
+            )
+            .unwrap(),
+        );
         assert!(!seq.is_append, "at notAfter → no append");
         assert!(seq.is_commit, "at notAfter → commit still propagates");
     }
@@ -989,11 +1101,8 @@ mod test {
         let p3 = producer(0x03);
 
         // Start read with both producers in the checkpoint.
-        let producers = resolve_checkpoint(
-            vec![checkpoint_entry(&p1, 0), checkpoint_entry(&p3, 0)],
-            u64::MAX,
-        )
-        .producers;
+        let producers =
+            resolve_checkpoint(vec![checkpoint_entry(&p1, 0), checkpoint_entry(&p3, 0)]).producers;
         s.reads.push(ReadState {
             binding_index: 0,
             journal: "test/journal/A".into(),
@@ -1010,24 +1119,28 @@ mod test {
         assert!(!s.flush.should_flush());
 
         // Sequence an OUTSIDE commit (sets flush ready via commit_enqueue).
-        let seq = sequence_document(
-            &s.reads[0],
-            &s.bindings[0],
-            &meta(p1, Clock::from_unix(100, 0), OUTSIDE, 0, 50),
-        )
-        .unwrap();
+        let seq = seq_doc(
+            sequence_document(
+                &s.reads[0],
+                &s.bindings[0],
+                &meta(p1, Clock::from_unix(100, 0), OUTSIDE, 0, 50),
+            )
+            .unwrap(),
+        );
         s.commit(0, p1, seq);
 
         // Now should_flush is true.
         assert!(s.flush.should_flush());
 
         // Add a second producer's document for richer frontier.
-        let seq = sequence_document(
-            &s.reads[0],
-            &s.bindings[0],
-            &meta(p3, Clock::from_unix(200, 0), OUTSIDE, 50, 100),
-        )
-        .unwrap();
+        let seq = seq_doc(
+            sequence_document(
+                &s.reads[0],
+                &s.bindings[0],
+                &meta(p3, Clock::from_unix(200, 0), OUTSIDE, 50, 100),
+            )
+            .unwrap(),
+        );
         s.commit(0, p3, seq);
 
         // Build frontier and start flush with 3 shards.
@@ -1154,7 +1267,7 @@ mod test {
 
         let p1 = producer(0x01);
 
-        let producers = resolve_checkpoint(vec![checkpoint_entry(&p1, 0)], u64::MAX).producers;
+        let producers = resolve_checkpoint(vec![checkpoint_entry(&p1, 0)]).producers;
         s.reads.push(ReadState {
             binding_index: 0,
             journal: "test/journal/A".into(),
@@ -1168,12 +1281,14 @@ mod test {
         });
 
         // ContinueBeginSpan: enqueued, no commit, offset set to begin_offset.
-        let seq = sequence_document(
-            &s.reads[0],
-            &s.bindings[0],
-            &meta(p1, Clock::from_unix(10, 0), CONTINUE, 100, 150),
-        )
-        .unwrap();
+        let seq = seq_doc(
+            sequence_document(
+                &s.reads[0],
+                &s.bindings[0],
+                &meta(p1, Clock::from_unix(10, 0), CONTINUE, 100, 150),
+            )
+            .unwrap(),
+        );
         assert!(seq.is_append);
         assert!(!seq.is_commit);
         assert_eq!(
@@ -1183,34 +1298,40 @@ mod test {
         s.commit(0, p1, seq);
 
         // ContinueExtendSpan: enqueued, no commit, offset preserved from BeginSpan.
-        let seq = sequence_document(
-            &s.reads[0],
-            &s.bindings[0],
-            &meta(p1, Clock::from_unix(20, 0), CONTINUE, 150, 200),
-        )
-        .unwrap();
+        let seq = seq_doc(
+            sequence_document(
+                &s.reads[0],
+                &s.bindings[0],
+                &meta(p1, Clock::from_unix(20, 0), CONTINUE, 150, 200),
+            )
+            .unwrap(),
+        );
         assert!(seq.is_append);
         assert!(!seq.is_commit);
         assert_eq!(seq.producer_state.offset, 100, "offset unchanged on extend");
         s.commit(0, p1, seq);
 
         // ContinueDuplicate: filtered out entirely.
-        let seq = sequence_document(
-            &s.reads[0],
-            &s.bindings[0],
-            &meta(p1, Clock::from_unix(15, 0), CONTINUE, 200, 250),
-        )
-        .unwrap();
+        let seq = seq_doc(
+            sequence_document(
+                &s.reads[0],
+                &s.bindings[0],
+                &meta(p1, Clock::from_unix(15, 0), CONTINUE, 200, 250),
+            )
+            .unwrap(),
+        );
         assert!(!seq.is_append);
         assert!(!seq.is_commit);
 
         // AckCommit: not enqueued, triggers commit/flush, offset becomes committed.
-        let seq = sequence_document(
-            &s.reads[0],
-            &s.bindings[0],
-            &meta(p1, Clock::from_unix(20, 0), ACK, 250, 300),
-        )
-        .unwrap();
+        let seq = seq_doc(
+            sequence_document(
+                &s.reads[0],
+                &s.bindings[0],
+                &meta(p1, Clock::from_unix(20, 0), ACK, 250, 300),
+            )
+            .unwrap(),
+        );
         assert!(!seq.is_append, "ACKs are never appended");
         assert!(seq.is_commit, "AckCommit triggers flush");
         assert_eq!(
@@ -1220,32 +1341,38 @@ mod test {
         s.commit(0, p1, seq);
 
         // AckDuplicate: no append, no commit (no spurious flush).
-        let seq = sequence_document(
-            &s.reads[0],
-            &s.bindings[0],
-            &meta(p1, Clock::from_unix(20, 0), ACK, 300, 350),
-        )
-        .unwrap();
+        let seq = seq_doc(
+            sequence_document(
+                &s.reads[0],
+                &s.bindings[0],
+                &meta(p1, Clock::from_unix(20, 0), ACK, 300, 350),
+            )
+            .unwrap(),
+        );
         assert!(!seq.is_append);
         assert!(!seq.is_commit, "AckDuplicate must not trigger flush");
 
         // Start a new CONTINUE span, then clean rollback (ACK at last_commit clock).
-        let seq = sequence_document(
-            &s.reads[0],
-            &s.bindings[0],
-            &meta(p1, Clock::from_unix(30, 0), CONTINUE, 350, 400),
-        )
-        .unwrap();
+        let seq = seq_doc(
+            sequence_document(
+                &s.reads[0],
+                &s.bindings[0],
+                &meta(p1, Clock::from_unix(30, 0), CONTINUE, 350, 400),
+            )
+            .unwrap(),
+        );
         assert!(seq.is_append);
         assert_eq!(seq.producer_state.offset, 350, "new span begin");
         s.commit(0, p1, seq);
 
-        let seq = sequence_document(
-            &s.reads[0],
-            &s.bindings[0],
-            &meta(p1, Clock::from_unix(20, 0), ACK, 400, 450),
-        )
-        .unwrap();
+        let seq = seq_doc(
+            sequence_document(
+                &s.reads[0],
+                &s.bindings[0],
+                &meta(p1, Clock::from_unix(20, 0), ACK, 400, 450),
+            )
+            .unwrap(),
+        );
         assert!(!seq.is_append);
         assert!(seq.is_commit, "AckCleanRollback triggers flush");
         assert_eq!(

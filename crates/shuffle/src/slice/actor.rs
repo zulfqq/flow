@@ -1,6 +1,10 @@
 use super::{
+    gap::Backfill,
     heap::{ReadyReadEntry, ReadyReadHeap},
-    read::{Meta, ReadState, ReadyRead, map_read_error, probe_read_start},
+    read::{
+        Meta, ReadFailure, ReadState, ReadyRead, classify_read_failure, map_read_error,
+        parse_lines_batch, probe_read_start,
+    },
     routing,
     state::{self, FlushState, ProgressState, Topology},
 };
@@ -40,6 +44,10 @@ pub struct SliceActor {
     >,
     /// Reads that are awaiting more data from Gazette brokers.
     pub pending_reads: stream::FuturesUnordered<stream::StreamFuture<super::ReadLines>>,
+    /// Historical backfill reads awaiting broker/storage I/O. A read lives here only
+    /// while no batch of it is being drained; once a batch resolves it becomes the
+    /// owning `Backfill`'s cursor, returning here only after the cursor drains.
+    pub pending_backfills: stream::FuturesUnordered<stream::StreamFuture<super::ReadLines>>,
     /// Number of pending reads that are caught up to their journal write head.
     /// We defer sending Append requests until all pending reads are tailing,
     /// ensuring no pending read has content that could preempt the current heap top.
@@ -52,43 +60,34 @@ pub struct SliceActor {
     pub parser: simd_doc::SimdParser,
     /// Ordered heap of reads with ready documents.
     pub ready_read_heap: ReadyReadHeap,
-    /// Main reads parked at a gapped producer's trigger ACK, keyed by read id.
-    /// The stashed `ReadyRead` holds the ACK document (head), its undrained
-    /// tail, and the inner `ReadLines` — so no later document of the journal is
-    /// reachable while parked, and nothing re-enters `pending_reads`. Held
-    /// outside `pending_reads`/`pending_probes`, so parking is automatically
-    /// exempt from the tailing gate and stalled-read accounting.
-    pub parked_mains: std::collections::HashMap<u32, ParkedMain>,
-    /// Historical backfill reads awaiting broker/storage I/O, keyed by the
-    /// backfill-tagged read id. Deliberately separate from `pending_reads`:
-    /// exempt from the tailing gate and stall accounting.
-    pub pending_backfills: stream::FuturesUnordered<stream::StreamFuture<super::ReadLines>>,
+    /// Active backfills of gapped producers' pending transactions, keyed by read
+    /// id. Each consolidates the parked main read (holding the trigger ACK head,
+    /// its undrained tail, and the inner `ReadLines`), the live target-producer
+    /// sequencing state, and the current historical batch cursor.
+    pub backfills: std::collections::HashMap<u32, Backfill>,
     /// Per-task metrics counters and gauges.
     pub metrics: super::Metrics,
 }
 
-/// A main read parked at a gapped producer's trigger ACK while its backfill
-/// runs. At most one per read (the read parks at the first trigger, so no
-/// second trigger can arrive while parked).
-pub struct ParkedMain {
-    /// The shelved `ReadyRead`, with the trigger ACK as its head document.
-    pub ready: Box<ReadyRead>,
-    /// The gapped producer whose ACK triggered the backfill.
-    pub target: uuid::Producer,
-    /// Trigger instant, for the backfill-duration histogram.
-    pub started_at: std::time::Instant,
-    /// Physical bytes fetched so far by the historical read, for the
-    /// completion event.
-    pub physical_bytes: u64,
+impl Drop for SliceActor {
+    /// Balance the `*_started` / `*_stopped` counters at session teardown (clean
+    /// Session EOF or task cancellation). Reads and backfills still running here
+    /// stop by teardown rather than through their normal per-journal paths;
+    /// counting them keeps `started - stopped` a live count that returns to zero
+    /// across sessions sharing a `shard_id` label.
+    fn drop(&mut self) {
+        let live_reads = self.pending_probes.len()
+            + self.pending_reads.len()
+            + self.ready_read_heap.len()
+            + self.backfills.len();
+        self.metrics.reads_stopped.increment(live_reads as u64);
+        self.metrics
+            .backfills_stopped
+            .increment(self.backfills.len() as u64);
+    }
 }
 
-/// Backfill reads are tagged by setting this high bit on their `ReadLines` id;
-/// `id & !BACKFILL_ID_BIT` indexes `self.reads`. This keeps `ReadyRead`/heap
-/// plumbing identical for main and backfill documents while letting the drain
-/// path route them differently.
-const BACKFILL_ID_BIT: u32 = 1 << 31;
-
-struct Buffers {
+pub(super) struct Buffers {
     packed_key: bytes::BytesMut,
     targets: Vec<usize>,
     permits: Vec<mpsc::Permit<'static, shuffle::LogRequest>>,
@@ -197,7 +196,13 @@ impl SliceActor {
 
                 // Lowest priority is processing journal listings and reads.
                 Some(probe_result) = self.pending_probes.next() => {
-                    let (start_offset, read) = probe_result?;
+                    let (start_offset, read) = match probe_result {
+                        Ok(ok) => ok,
+                        Err(err) => {
+                            self.metrics.reads_stopped.increment(1);
+                            return Err(err);
+                        }
+                    };
                     // Seed the ReadState's offsets at the probe's resolved start
                     // before parking, so byte deltas exclude the filtered range
                     // the read skipped.
@@ -227,18 +232,6 @@ impl SliceActor {
             flush_cycle = self.flush.cycle,
             "SliceActor::serve exiting on Session EOF"
         );
-
-        // Release any gapped/backfilling state and cancel in-flight historical
-        // reads. Gauges are keyed by shard_id and outlive the session, so zero
-        // the gapped-producers gauge explicitly. Recovery is derived purely from
-        // durable producer checkpoints, so nothing here is persisted.
-        for read_id in 0..self.reads.len() {
-            self.release_read_gaps(read_id, "read released (session ended); releasing gap");
-        }
-        self.parked_mains.clear();
-        self.pending_backfills.clear();
-        self.metrics.gapped_producers.set(0.0);
-
         self.log_request_tx.clear(); // Drop all tx handles to close.
 
         // Read clean EOF from all Log RPCs.
@@ -353,47 +346,28 @@ impl SliceActor {
         let journal = spec.name.into_boxed_str();
         let read_id = self.reads.len() as u32;
 
-        // Resolve the checkpoint into producer state, gapped producers, and a
-        // start offset R that re-reads at most `reread_bound_bytes` (B) behind
-        // the checkpoint's furthest justified position M.
-        let reread_bound_bytes = self.topology.reread_bound_bytes;
+        // Resolve the checkpoint into producer state, gapped producers, and
+        // the start offset M: the checkpoint's furthest justified position.
         let state::ResolvedCheckpoint {
             offset,
             producers,
             gaps,
-            max_offset,
-        } = state::resolve_checkpoint(checkpoint, reread_bound_bytes);
+        } = state::resolve_checkpoint(checkpoint);
 
-        // Restart-resolution metrics: bytes conservatively re-read (M - R) and
-        // the split of uncommitted producers recovered normally vs gapped.
-        self.metrics
-            .restart_reread_bytes
-            .increment((max_offset - offset).max(0) as u64);
-        let normal_uncommitted = producers
-            .iter()
-            .filter(|(producer, ps)| ps.offset >= 0 && !gaps.contains_key(*producer))
-            .count();
-        self.metrics
-            .restart_normal_producers
-            .increment(normal_uncommitted as u64);
-        self.metrics
-            .restart_gapped_producers
-            .increment(gaps.len() as u64);
-
-        // Emit a gap-creation event per gapped producer (F, M, R, B).
-        for (producer, gap) in gaps.iter() {
+        // Emit a gap-creation event per gapped producer (F, M). All gap and
+        // backfill lifecycle events share the "backfill" track so an operator
+        // sees creation → trigger → completion/rollback as one ordered series.
+        for (producer, gap_begin) in gaps.iter() {
             service_kit::event!(
-                tracing::Level::INFO,
-                "gap",
+                tracing::Level::DEBUG,
+                "backfill",
                 session = self.topology.session_id,
                 read_id,
                 binding = binding.index,
                 journal = journal.to_string(),
                 producer = service_kit::event::debug(*producer),
-                gap_begin = gap.gap_begin(), // F
-                max_offset,                  // M
-                start_offset = offset,       // R
-                reread_bound_bytes,          // B
+                gap_begin = *gap_begin, // F
+                start_offset = offset,  // M
                 "classified producer as gapped on restart",
             );
         }
@@ -438,7 +412,6 @@ impl SliceActor {
             producers,
             gaps,
         ));
-        self.refresh_gapped_gauge();
 
         self.pending_probes.push(Box::pin(async move {
             // Probe where this read effectively begins (after `begin_mod_time`
@@ -498,16 +471,6 @@ impl SliceActor {
     /// Pre-condition: `read` is *not* in `pending_reads`, and carries no
     /// classification membership to undo (that happens in `on_pending_read_resolved`).
     fn park_or_process(&mut self, mut read: super::ReadLines) -> anyhow::Result<()> {
-        // Historical backfill reads live in `pending_backfills`, exempt from the
-        // tailing gate and stall accounting (spec §Ordering and scheduling).
-        if read.id() & BACKFILL_ID_BIT != 0 {
-            if let Some(result) = read.next().now_or_never() {
-                return self.process_backfill_result(result, read);
-            }
-            self.pending_backfills.push(read.into_future());
-            return Ok(());
-        }
-
         if let Some(result) = read.next().now_or_never() {
             return self.process_read_result(result, read);
         }
@@ -558,15 +521,6 @@ impl SliceActor {
         self.process_read_result(result, read)
     }
 
-    /// Recompute and publish the unresolved-gapped-producers gauge from live
-    /// read state. Called after any gap is created, resolved, or released. The
-    /// gauge outlives the session (keyed by shard_id), so the actor also zeroes
-    /// it on exit.
-    fn refresh_gapped_gauge(&self) {
-        let total: usize = self.reads.iter().map(|r| r.gaps.len()).sum();
-        self.metrics.gapped_producers.set(total as f64);
-    }
-
     fn emit_stall_event(&self, read_id: u32, message: &'static str) {
         let read_state = &self.reads[read_id as usize];
         service_kit::event!(
@@ -587,7 +541,7 @@ impl SliceActor {
     fn process_read_result(
         &mut self,
         result: Option<gazette::RetryResult<gazette::journal::read::LinesBatch>>,
-        mut read: super::ReadLines,
+        read: super::ReadLines,
     ) -> anyhow::Result<()> {
         let read_state = &mut self.reads[read.id() as usize];
         let binding = &self.topology.bindings[read_state.binding_index as usize];
@@ -603,48 +557,31 @@ impl SliceActor {
                 "stopped journal read (EOF)",
             );
             self.metrics.reads_stopped.increment(1);
-            self.release_read_gaps(read.id() as usize, "read stopped (EOF); releasing gap");
             return Ok(());
         };
 
-        let mut lines_batch = match result {
+        let lines_batch = match result {
             Err(gazette::RetryError {
                 attempt,
                 inner: err,
-            }) => match err {
-                gazette::Error::BrokerStatus(broker::Status::JournalNotFound) => {
+            }) => match classify_read_failure(err) {
+                ReadFailure::JournalRemoved(status) => {
+                    self.metrics.reads_stopped.increment(1);
+                    // A dead main read has no active backfill (a backfilling read
+                    // is parked outside `pending_reads`) and its `gaps` are inert,
+                    // so no release is needed here.
                     service_kit::event!(
                         tracing::Level::INFO,
                         "read",
                         read_id = read.id(),
                         binding = binding.index,
                         journal,
-                        "stopped journal read (JOURNAL_NOT_FOUND)",
-                    );
-                    self.metrics.reads_stopped.increment(1);
-                    self.release_read_gaps(
-                        read.id() as usize,
-                        "read stopped (JOURNAL_NOT_FOUND); releasing gap",
+                        "stopped journal read ({})",
+                        status.as_str_name(),
                     );
                     return Ok(());
                 }
-                gazette::Error::BrokerStatus(broker::Status::Suspended) => {
-                    service_kit::event!(
-                        tracing::Level::INFO,
-                        "read",
-                        read_id = read.id(),
-                        binding = binding.index,
-                        journal,
-                        "stopped journal read (SUSPENDED)",
-                    );
-                    self.metrics.reads_stopped.increment(1);
-                    self.release_read_gaps(
-                        read.id() as usize,
-                        "read stopped (SUSPENDED); releasing gap",
-                    );
-                    return Ok(());
-                }
-                err if err.is_transient() => {
+                ReadFailure::Transient(err) => {
                     service_kit::event!(
                         tracing::Level::WARN,
                         "read",
@@ -657,7 +594,8 @@ impl SliceActor {
                     );
                     return self.park_or_process(read);
                 }
-                err => {
+                ReadFailure::Terminal(err) => {
+                    self.metrics.reads_stopped.increment(1);
                     return Err(map_read_error(
                         err,
                         &read_state.journal,
@@ -684,50 +622,15 @@ impl SliceActor {
             "received LinesBatch",
         );
 
-        let transcoded = match simd_doc::transcode_many(
+        let ready_read = parse_lines_batch(
             &mut self.parser,
-            &mut lines_batch.content,
-            &mut lines_batch.offset,
-            Default::default(),
-        ) {
-            Err((err, location)) => {
-                return Err(map_read_error(
-                    gazette::Error::Parsing { err, location },
-                    &read_state.journal,
-                    binding.state_key(),
-                    "transcoding documents",
-                ));
-            }
-            Ok(transcoded) => transcoded,
-        };
-
-        // There may be a remainder if we failed to parse partway through.
-        // Put it back to handle it next time.
-        if !lines_batch.content.is_empty() {
-            read.as_mut().put_back(lines_batch.content.into());
-        }
-
-        let metas = super::read::extract_metas(
-            &transcoded,
-            &binding.source_uuid_ptr,
             &mut self.validators[read_state.binding_index as usize],
+            binding,
             &read_state.journal,
+            read,
+            lines_batch,
+            "transcoding documents",
         )?;
-
-        // Consume into owned documents and pair with pre-extracted metadata.
-        let mut doc_tail = transcoded.into_iter();
-        let mut meta_tail = metas.into_iter();
-
-        let (doc, _) = doc_tail.next().expect("non-empty transcoded");
-        let meta = meta_tail.next().expect("non-empty metas");
-
-        let ready_read = ReadyRead {
-            doc,
-            meta,
-            doc_tail,
-            meta_tail,
-            inner: read,
-        };
 
         self.ready_read_heap.push(ReadyReadEntry {
             priority: binding.priority,
@@ -788,109 +691,74 @@ impl SliceActor {
                 }
             }
 
+            // Drain any historical backfill batch cursors: recovered
+            // target-producer documents are appended directly, without heap
+            // ordering or clock-delay gating. This is sound because the trigger
+            // already cleared the clock-delay gate below, and same-binding
+            // read-delay plus strictly-ascending per-producer clocks put every
+            // historical document's adjusted clock in the past. Runs after the
+            // flush check but independent of the heap and its tailing gate; all
+            // backfill appends precede the re-presented trigger's own processing.
+            if let Some(tx) = self.try_drain_backfills(buffers)? {
+                return Ok(future::Either::Left(tx.reserve_owned().map(ok)));
+            }
+
             // Defer draining if any read could still resolve to content that
             // preempts the current heap top: a parked non-tailing (stalled) read,
             // or a newly-started read still probing its write head (parked in
             // `pending_probes`, not yet classified as tailing/stalled). Parked
-            // main reads (`parked_mains`) and historical backfill reads
+            // main reads (`backfills`) and historical backfill reads
             // (`pending_backfills`) are deliberately outside `pending_reads`, so
             // they neither contribute to nor are blocked by this gate.
-            if self.heap_drain_blocked() {
+            if self.tailing_reads != self.pending_reads.len() || !self.pending_probes.is_empty() {
                 return Ok(idle);
             }
 
             // Do we have a document ready for append?
             let Some(ReadyReadEntry {
                 adjusted_clock,
-                priority,
                 inner: ready_read,
+                ..
             }) = self.ready_read_heap.peek()
             else {
                 return Ok(idle);
             };
             let adjusted_clock = *adjusted_clock;
-            let priority = *priority;
             let ready_read = ready_read.as_deref().unwrap();
-            let raw_id = ready_read.inner.id();
+            let read_id = ready_read.inner.id() as usize;
             let meta = ready_read.meta; // `Meta` is Copy.
 
             // Gate on the adjusted clock: sleep until wall-clock time catches up.
-            // Applies uniformly to main and historical backfill documents —
-            // implementations must not assume historical clocks are already past.
+            // This is how read delays impose cross-transform ordering. Only main
+            // reads reach here; backfill documents are drained above.
             if let Some(wait) = state::clock_delay(&adjusted_clock, now, crate::now_clock) {
                 return Ok(future::Either::Right(future::Either::Left(
                     tokio::time::sleep(wait).map(|()| true),
                 )));
             }
 
-            // Route historical backfill documents through their own path (spec
-            // §Backfill transaction). They index `self.reads` by the masked id.
-            if raw_id & BACKFILL_ID_BIT != 0 {
-                if let Some(tx) =
-                    self.drain_backfill_entry(buffers, raw_id & !BACKFILL_ID_BIT, priority, &meta)?
-                {
-                    return Ok(future::Either::Left(tx.reserve_owned().map(ok)));
-                }
-                continue;
-            }
-            let read_id = raw_id as usize;
-
-            // A gapped producer's main-read documents are classified against its
-            // frozen recovered state, not the speculative `uuid::sequence` (whose
-            // `max_continue == 0` misreports rollbacks). See spec §Main-read
-            // outcomes while gapped.
-            if self.reads[read_id].gaps.contains_key(&meta.producer) {
-                let gap_last_commit = self.reads[read_id]
-                    .settled
-                    .get(&meta.producer)
-                    .map(|ps| ps.last_commit)
-                    .unwrap_or_default();
-
-                match state::sequence_gapped(gap_last_commit, &meta) {
-                    state::GappedOutcome::Suppress | state::GappedOutcome::Drop => {
-                        // Advance the main read past the document without any
-                        // producer-state mutation (a suppressed ContinueBeginSpan
-                        // must not overwrite the pinned F) and without append.
-                        let ready_read = self.ready_read_heap.pop().unwrap().inner.unwrap();
-                        self.reads[read_id].read_offset = meta.end_offset;
-                        let read_delay = self.topology.bindings
-                            [self.reads[read_id].binding_index as usize]
-                            .read_delay;
-                        self.continue_ready_read(ready_read, priority, read_delay)?;
+            // Sequence the head document against the read's producer state. This
+            // is a pure decision — over gapped or normal state; it mutates
+            // nothing — so the caller performs the I/O and, for a gapped
+            // producer, resolves the gap and reports the outcome only after the
+            // document is irrevocably consumed below. Sequencing stays AFTER the
+            // clock-delay gate: a backfill's direct historical appends are sound
+            // only because the trigger ACK cleared that gate first.
+            let binding = &self.topology.bindings[self.reads[read_id].binding_index as usize];
+            let (sequenced, gapped) =
+                match state::sequence_document(&self.reads[read_id], binding, &meta)? {
+                    state::Sequenced::Park => {
+                        // A gapped producer's first newer document (CONTINUE or
+                        // ACK, the heap head): park the main read at it, then
+                        // open its bounded historical backfill. The trigger is
+                        // not sequenced now; on completion it is re-presented to
+                        // the heap and sequenced through this same normal path.
+                        self.park_backfill(read_id as u32, &meta);
+                        self.start_backfill(read_id as u32)?;
                         continue;
                     }
-                    outcome @ (state::GappedOutcome::CleanRollback
-                    | state::GappedOutcome::DeepRollback) => {
-                        let deep = matches!(outcome, state::GappedOutcome::DeepRollback);
-                        self.resolve_gapped_rollback(read_id, priority, &meta, deep)?;
-                        continue;
-                    }
-                    state::GappedOutcome::TriggerBackfill => {
-                        self.trigger_backfill(read_id as u32, &meta)?;
-                        continue;
-                    }
-                    state::GappedOutcome::OutsideResolve => {
-                        // Discard the gap, then fall through to process the
-                        // OUTSIDE commit through the normal path in this same
-                        // iteration (its frozen `max_continue == 0` lets
-                        // `OutsideCommit` proceed).
-                        self.reads[read_id].gaps.remove(&meta.producer);
-                        self.refresh_gapped_gauge();
-                        let read_state = &self.reads[read_id];
-                        service_kit::event!(
-                            tracing::Level::INFO,
-                            "gap",
-                            session = self.topology.session_id,
-                            read_id,
-                            binding = read_state.binding_index,
-                            journal = read_state.journal.to_string(),
-                            producer = service_kit::event::debug(meta.producer),
-                            clock = service_kit::event::debug(meta.clock),
-                            "resolved gap via newer OUTSIDE commit (no historical I/O)",
-                        );
-                    }
-                }
-            }
+                    state::Sequenced::Doc { doc, gapped } => (doc, gapped),
+                };
 
             let read_state = &mut self.reads[read_id];
             let binding = &self.topology.bindings[read_state.binding_index as usize];
@@ -901,8 +769,6 @@ impl SliceActor {
                 .inner
                 .as_deref()
                 .unwrap();
-
-            let sequenced = state::sequence_document(read_state, binding, &meta)?;
 
             // If this is an Append, attempt to send it to the appropriate shard(s).
             if sequenced.is_append {
@@ -942,6 +808,62 @@ impl SliceActor {
                 mut doc_tail,
                 mut meta_tail,
             } = *ready_read;
+
+            // Resolve a gapped producer's gap now that its document is
+            // irrevocably consumed. This MUST fire post-pop, exactly once: an
+            // OutsideResolve with is_append=true can hit a full Log channel
+            // before the pop and be re-sequenced on wake, and because sequencing
+            // is pure (no gap mutation) that retry re-derives the identical
+            // outcome — so gap removal and its event cannot run before the pop.
+            // Invariant: a gapped producer's gap is removed exactly when its
+            // document commits (rollback or newer OUTSIDE); a Drop — and a
+            // non-gapped producer (`None`) — retain it, the latter having none.
+            // (A TriggerBackfill never reaches here: it returned `Park` above.)
+            match gapped {
+                Some(
+                    outcome @ (state::GappedOutcome::CleanRollback
+                    | state::GappedOutcome::DeepRollback),
+                ) => {
+                    let deep = matches!(outcome, state::GappedOutcome::DeepRollback);
+                    read_state.gaps.remove(&producer);
+                    if deep {
+                        tracing::warn!(
+                            binding=%binding.state_key(),
+                            clock=?clock,
+                            journal=%read_state.journal,
+                            producer=?producer,
+                            "gapped producer deep-rolled back prior to its last committed clock (possible loss of exactly-once guarantees)",
+                        );
+                    }
+                    service_kit::event!(
+                        tracing::Level::INFO,
+                        "backfill",
+                        session = self.topology.session_id,
+                        read_id,
+                        binding = read_state.binding_index,
+                        journal = read_state.journal.to_string(),
+                        producer = service_kit::event::debug(producer),
+                        clock = service_kit::event::debug(clock),
+                        deep_rollback = deep,
+                        "resolved gap by rollback (no historical I/O)",
+                    );
+                }
+                Some(state::GappedOutcome::OutsideResolve) => {
+                    read_state.gaps.remove(&producer);
+                    service_kit::event!(
+                        tracing::Level::INFO,
+                        "backfill",
+                        session = self.topology.session_id,
+                        read_id,
+                        binding = read_state.binding_index,
+                        journal = read_state.journal.to_string(),
+                        producer = service_kit::event::debug(producer),
+                        clock = service_kit::event::debug(clock),
+                        "resolved gap via newer OUTSIDE commit (no historical I/O)",
+                    );
+                }
+                _ => {}
+            }
 
             // Track maximum forward progress of the read.
             read_state.read_offset = end_offset;
@@ -1000,560 +922,6 @@ impl SliceActor {
         }
     }
 
-    /// Whether the ready heap must not drain yet: some pending read could still
-    /// resolve to content that preempts the current heap top. Parked main reads
-    /// and historical backfill reads are outside `pending_reads`, so they do not
-    /// participate (spec §Ordering and scheduling).
-    fn heap_drain_blocked(&self) -> bool {
-        self.tailing_reads != self.pending_reads.len() || !self.pending_probes.is_empty()
-    }
-
-    /// Advance a popped `ReadyRead` to its next buffered document: re-push it
-    /// onto the ready heap, or (when its batch is drained) hand the inner read
-    /// back to `park_or_process` to await more I/O. Shared by the main, gapped,
-    /// and backfill drain paths. The just-consumed head document is dropped.
-    fn continue_ready_read(
-        &mut self,
-        mut ready_read: Box<ReadyRead>,
-        priority: u32,
-        read_delay: uuid::Clock,
-    ) -> anyhow::Result<()> {
-        let ReadyRead {
-            inner: read,
-            doc: _consumed_doc,
-            meta: _consumed_meta,
-            mut doc_tail,
-            mut meta_tail,
-        } = *ready_read;
-
-        match (doc_tail.next(), meta_tail.next()) {
-            (Some((doc, _)), Some(meta)) => {
-                *ready_read = ReadyRead {
-                    doc,
-                    meta,
-                    doc_tail,
-                    meta_tail,
-                    inner: read,
-                };
-                self.ready_read_heap.push(ReadyReadEntry {
-                    priority,
-                    adjusted_clock: ready_read.meta.clock + read_delay,
-                    inner: Some(ready_read),
-                });
-                Ok(())
-            }
-            (None, None) => self.park_or_process(read),
-            _ => unreachable!("doc_tail and meta_tail have equal length"),
-        }
-    }
-
-    /// Resolve a gapped producer's ACK at or below `last_commit` as a durable
-    /// rollback (clean when `deep == false`, deep otherwise). The rollback is
-    /// made durable — a plain in-memory `AckDuplicate` would leave the positive
-    /// gap offset `F` in the checkpoint forever — by emitting a committed
-    /// `pending` entry `{last_commit: ack_clock, offset: -ack_end}`. No
-    /// historical I/O is issued: the gap proves a pending span exists, and an
-    /// ACK at or below `last_commit` rolls all of it back.
-    fn resolve_gapped_rollback(
-        &mut self,
-        read_id: usize,
-        priority: u32,
-        meta: &Meta,
-        deep: bool,
-    ) -> anyhow::Result<()> {
-        let ready_read = self.ready_read_heap.pop().unwrap().inner.unwrap();
-        let binding = &self.topology.bindings[self.reads[read_id].binding_index as usize];
-
-        if deep {
-            tracing::warn!(
-                binding=%binding.state_key(),
-                clock=?meta.clock,
-                journal=%self.reads[read_id].journal,
-                producer=?meta.producer,
-                "gapped producer deep-rolled back prior to its last committed clock (possible loss of exactly-once guarantees)",
-            );
-        }
-
-        // ACKs are never appended. Extract causal hints from the ACK document.
-        if meta.flags == uuid::Flags::ACK_TXN {
-            state::extract_causal_hints(
-                &self.topology.hint_index,
-                &self.reads[read_id].journal,
-                binding.cohort,
-                self.reads[read_id].binding_index,
-                meta.producer,
-                meta.clock,
-                ready_read.doc.get(),
-                &mut self.causal_hints,
-            )?;
-        }
-        let read_delay = binding.read_delay;
-        let cohort_binding_index = self.reads[read_id].binding_index;
-
-        // Durable committed entry: the negative offset wins by magnitude under
-        // Frontier reduction even if a base retains a higher (monotonic)
-        // last_commit — matching existing deep-rollback semantics.
-        let read_state = &mut self.reads[read_id];
-        read_state.read_offset = meta.end_offset;
-        read_state.gaps.remove(&meta.producer);
-        _ = read_state.pending.insert(
-            meta.producer,
-            super::producer::ProducerState {
-                last_commit: meta.clock,
-                max_continue: uuid::Clock::zero(),
-                offset: -meta.end_offset,
-            },
-        );
-        self.flush.set_ready();
-
-        service_kit::event!(
-            tracing::Level::INFO,
-            "gap",
-            session = self.topology.session_id,
-            read_id,
-            binding = cohort_binding_index,
-            journal = self.reads[read_id].journal.to_string(),
-            producer = service_kit::event::debug(meta.producer),
-            clock = service_kit::event::debug(meta.clock),
-            deep_rollback = deep,
-            "resolved gap by rollback (no historical I/O)",
-        );
-        self.refresh_gapped_gauge();
-        self.continue_ready_read(ready_read, priority, read_delay)
-    }
-
-    /// Park the main read at a gapped producer's trigger ACK and begin a
-    /// historical backfill of `[F, ack.begin)` (spec §Trigger and parking).
-    /// The speculative `AckEmpty` state is intentionally NOT applied; the ACK
-    /// is sequenced only at completion, against the reconstructed span.
-    fn trigger_backfill(&mut self, read_key: u32, meta: &Meta) -> anyhow::Result<()> {
-        let read_id = read_key as usize;
-
-        // Pop and stash the whole ReadyRead — its head is the trigger ACK and no
-        // later document of the journal is reachable while parked. The main
-        // read's logical offset stays at the ACK's begin.
-        let ready = self.ready_read_heap.pop().unwrap().inner.unwrap();
-
-        let gap_begin = self.reads[read_id]
-            .gaps
-            .get(&meta.producer)
-            .expect("producer is gapped")
-            .gap_begin();
-        let recovered_last_commit = self.reads[read_id]
-            .settled
-            .get(&meta.producer)
-            .map(|ps| ps.last_commit)
-            .unwrap_or_default();
-
-        // Transition Gapped → Backfilling. `live` reconstructs the pending span
-        // from the recovered state; it never mirrors into pending/settled.
-        _ = self.reads[read_id].gaps.insert(
-            meta.producer,
-            super::gap::GapState::Backfilling {
-                gap_begin,
-                live: super::producer::ProducerState {
-                    last_commit: recovered_last_commit,
-                    max_continue: uuid::Clock::zero(),
-                    offset: gap_begin,
-                },
-                ack: *meta,
-            },
-        );
-        _ = self.parked_mains.insert(
-            read_key,
-            ParkedMain {
-                ready,
-                target: meta.producer,
-                started_at: std::time::Instant::now(),
-                physical_bytes: 0,
-            },
-        );
-
-        let binding = &self.topology.bindings[self.reads[read_id].binding_index as usize];
-        service_kit::event!(
-            tracing::Level::INFO,
-            "backfill",
-            session = self.topology.session_id,
-            read_id,
-            binding = binding.index,
-            journal = self.reads[read_id].journal.to_string(),
-            producer = service_kit::event::debug(meta.producer),
-            gap_begin, // F
-            ack_begin = meta.begin_offset,
-            "triggering backfill of gapped producer's pending transaction",
-        );
-        self.metrics.backfills_started.increment(1);
-        self.refresh_gapped_gauge();
-
-        // Empty range (e.g. M == R == F, or a hint-only producer whose ACK
-        // begins at F): no historical read; go straight to completion.
-        if gap_begin == meta.begin_offset {
-            return self.complete_backfill(read_key);
-        }
-
-        // Start the bounded, non-blocking historical read. Same client, auth,
-        // begin_mod_time, schema validation, and partition-filtered journal as
-        // the main read; no write-head probe is needed for a bounded range.
-        let client = (*self.topology.journal_clients[binding.index as usize]).clone();
-        let request = broker::ReadRequest {
-            journal: format!(
-                "{};{}",
-                self.reads[read_id].journal, binding.journal_read_suffix
-            ),
-            begin_mod_time: binding.not_before.to_unix().0 as i64,
-            block: false,
-            do_not_proxy: true,
-            end_offset: meta.begin_offset, // exclusive
-            metadata_only: false,
-            offset: gap_begin, // F
-            min_etcd_revision: 0,
-            header: None,
-        };
-        let read: super::ReadLines = Box::pin(gazette::journal::read::ReadLines::new(
-            client.read(request).boxed(),
-            read_key | BACKFILL_ID_BIT,
-            false, // Never tailing: the range is bounded and historical.
-        ));
-        self.pending_backfills.push(read.into_future());
-
-        Ok(())
-    }
-
-    /// Drain one historical backfill document from the ready heap. Returns
-    /// `Some(tx)` when an Append channel lacked capacity (the caller wakes on
-    /// it and retries), `None` otherwise. Backfill documents never touch the
-    /// main read's offset baselines or `pending`/`settled` (spec §Read
-    /// positions, §Completion).
-    fn drain_backfill_entry(
-        &mut self,
-        buffers: &mut Buffers,
-        read_key: u32,
-        priority: u32,
-        meta: &Meta,
-    ) -> anyhow::Result<Option<mpsc::Sender<shuffle::LogRequest>>> {
-        let read_id = read_key as usize;
-        let target = self
-            .parked_mains
-            .get(&read_key)
-            .expect("backfill has a parked main read")
-            .target;
-
-        let read_delay =
-            self.topology.bindings[self.reads[read_id].binding_index as usize].read_delay;
-
-        // Documents of other producers are already represented by checkpoint
-        // state or belong to independent gaps: skip without sequencing, state
-        // mutation, key extraction, or append.
-        if meta.producer != target {
-            let ready_read = self.ready_read_heap.pop().unwrap().inner.unwrap();
-            self.continue_ready_read(ready_read, priority, read_delay)?;
-            return Ok(None);
-        }
-
-        // Sequence the target producer's historical document against the gap's
-        // `live` state (initialized from the recovered checkpoint).
-        let live = match self.reads[read_id].gaps.get(&target) {
-            Some(super::gap::GapState::Backfilling { live, .. }) => live.clone(),
-            _ => unreachable!("target producer is backfilling"),
-        };
-        let binding = &self.topology.bindings[self.reads[read_id].binding_index as usize];
-        let sequenced =
-            state::sequence_producer(live, &self.reads[read_id].journal, binding, meta)?;
-
-        // One-transaction invariant: the parked trigger ACK is the only
-        // legitimate commit, sequenced at completion. Any commit inside
-        // `[F, ack.begin)` contradicts the recovered checkpoint.
-        if sequenced.is_commit {
-            anyhow::bail!(
-                "backfill of journal {} (binding {}) hit an unexpected committing document at \
-                 offset {} for target producer {:?}: a distinct transaction boundary inside the \
-                 historical range contradicts the recovered checkpoint",
-                self.reads[read_id].journal,
-                binding.state_key(),
-                meta.begin_offset,
-                target,
-            );
-        }
-
-        if sequenced.is_append {
-            let ready_read = self
-                .ready_read_heap
-                .peek()
-                .unwrap()
-                .inner
-                .as_deref()
-                .unwrap();
-            if let Err(tx) = Self::try_log_request_append_tx(
-                binding,
-                buffers,
-                &self.reads[read_id].journal,
-                &self.topology.shards,
-                &mut self.log_prev_journal,
-                &self.log_request_tx,
-                ready_read,
-            ) {
-                return Ok(Some(tx));
-            }
-        }
-
-        // Commit `live` forward (never `pending`/`settled`) and continue.
-        let ready_read = self.ready_read_heap.pop().unwrap().inner.unwrap();
-        if let Some(super::gap::GapState::Backfilling { live, .. }) =
-            self.reads[read_id].gaps.get_mut(&target)
-        {
-            *live = sequenced.producer_state;
-        }
-        self.continue_ready_read(ready_read, priority, read_delay)?;
-        Ok(None)
-    }
-
-    /// Complete a backfill once its historical range has been fully read: the
-    /// single atomic visibility boundary of the recovered transaction (spec
-    /// §Completion). Sequences the shelved ACK against the reconstructed span,
-    /// extracts causal hints, emits committed producer progress, flushes, and
-    /// resumes the main read strictly after the ACK.
-    fn complete_backfill(&mut self, read_key: u32) -> anyhow::Result<()> {
-        let read_id = read_key as usize;
-        let ParkedMain {
-            ready,
-            target,
-            started_at,
-            physical_bytes,
-        } = self
-            .parked_mains
-            .remove(&read_key)
-            .expect("completing backfill has a parked main read");
-
-        let (gap_begin, live, ack) = match self.reads[read_id].gaps.remove(&target) {
-            Some(super::gap::GapState::Backfilling {
-                gap_begin,
-                live,
-                ack,
-            }) => (gap_begin, live, ack),
-            _ => unreachable!("completing backfill has a Backfilling gap"),
-        };
-
-        // AckEmpty (no reconstructed CONTINUEs) is only expected when historical
-        // content was unavailable or filtered — a suspiciously short backfill.
-        let ack_empty = live.max_continue == uuid::Clock::zero();
-
-        let binding = &self.topology.bindings[self.reads[read_id].binding_index as usize];
-        let sequenced =
-            state::sequence_producer(live, &self.reads[read_id].journal, binding, &ack)?;
-
-        if ack.flags == uuid::Flags::ACK_TXN {
-            state::extract_causal_hints(
-                &self.topology.hint_index,
-                &self.reads[read_id].journal,
-                binding.cohort,
-                self.reads[read_id].binding_index,
-                ack.producer,
-                ack.clock,
-                ready.doc.get(),
-                &mut self.causal_hints,
-            )?;
-        }
-        let read_delay = binding.read_delay;
-        let priority = binding.priority;
-
-        // The atomic visibility boundary: committed producer progress, causal
-        // hints, and every backfilled append become durable together in the
-        // next flush.
-        _ = self.reads[read_id]
-            .pending
-            .insert(target, sequenced.producer_state);
-        self.reads[read_id].read_offset = ack.end_offset;
-        self.flush.set_ready();
-
-        let elapsed = started_at.elapsed();
-        self.metrics.backfills_completed.increment(1);
-        self.metrics
-            .backfill_duration_seconds
-            .record(elapsed.as_secs_f64());
-        self.metrics
-            .backfill_range_bytes
-            .record((ack.begin_offset - gap_begin) as f64);
-
-        service_kit::event!(
-            tracing::Level::INFO,
-            "backfill",
-            session = self.topology.session_id,
-            read_id,
-            binding = self.reads[read_id].binding_index,
-            journal = self.reads[read_id].journal.to_string(),
-            producer = service_kit::event::debug(target),
-            range_bytes = ack.begin_offset - gap_begin,
-            physical_bytes,
-            duration_ms = elapsed.as_millis() as u64,
-            ack_empty, // true flags a suspiciously short backfill (fragment loss)
-            "completed backfill of gapped producer's transaction",
-        );
-        self.refresh_gapped_gauge();
-
-        // Resume the main read strictly after the ACK.
-        self.continue_ready_read(ready, priority, read_delay)
-    }
-
-    /// Process a historical backfill read's resolution. Mirrors
-    /// `process_read_result` but never touches main-read offset baselines or
-    /// `write_head`, counts physical bytes into the backfill counter, and on
-    /// stream end completes the backfill.
-    fn process_backfill_result(
-        &mut self,
-        result: Option<gazette::RetryResult<gazette::journal::read::LinesBatch>>,
-        mut read: super::ReadLines,
-    ) -> anyhow::Result<()> {
-        let read_key = read.id() & !BACKFILL_ID_BIT;
-        let read_id = read_key as usize;
-        let binding = &self.topology.bindings[self.reads[read_id].binding_index as usize];
-        let journal = read.fragment().journal.clone();
-
-        let Some(result) = result else {
-            // The bounded stream reached `end_offset`: every prior batch was
-            // fully drained from the heap, so all historical Appends precede the
-            // final ACK flush on each Log channel. Complete the backfill.
-            return self.complete_backfill(read_key);
-        };
-
-        let mut lines_batch = match result {
-            Err(gazette::RetryError {
-                attempt,
-                inner: err,
-            }) => match err {
-                gazette::Error::BrokerStatus(
-                    broker::Status::JournalNotFound | broker::Status::Suspended,
-                ) => {
-                    // Deletion or FULL suspension implies no fragments remain:
-                    // release the read's gap and parked main (dropping `read`
-                    // cancels the historical stream).
-                    service_kit::event!(
-                        tracing::Level::INFO,
-                        "backfill",
-                        read_id,
-                        binding = binding.index,
-                        journal,
-                        "backfill journal removed (JOURNAL_NOT_FOUND/SUSPENDED); releasing gap",
-                    );
-                    self.metrics.backfills_failed.increment(1);
-                    self.release_read_gaps(read_id, "journal removed during backfill");
-                    return Ok(());
-                }
-                err if err.is_transient() => {
-                    service_kit::event!(
-                        tracing::Level::WARN,
-                        "backfill",
-                        read_id,
-                        binding = binding.index,
-                        journal,
-                        attempt,
-                        err = service_kit::event::debug(err),
-                        "transient error during backfill read (will retry)",
-                    );
-                    return self.park_or_process(read);
-                }
-                err => {
-                    self.metrics.backfills_failed.increment(1);
-                    return Err(map_read_error(
-                        err,
-                        &self.reads[read_id].journal,
-                        binding.state_key(),
-                        "reading backfill lines",
-                    ));
-                }
-            },
-            Ok(lines_batch) => lines_batch,
-        };
-
-        // Physical bytes fetched, including bytes skipped for other producers.
-        // Do NOT update main-read `write_head` or offset baselines.
-        let n = lines_batch.content.len() as u64;
-        self.metrics.backfill_bytes_read.increment(n);
-        if let Some(pm) = self.parked_mains.get_mut(&read_key) {
-            pm.physical_bytes += n;
-        }
-
-        let transcoded = match simd_doc::transcode_many(
-            &mut self.parser,
-            &mut lines_batch.content,
-            &mut lines_batch.offset,
-            Default::default(),
-        ) {
-            Err((err, location)) => {
-                self.metrics.backfills_failed.increment(1);
-                return Err(map_read_error(
-                    gazette::Error::Parsing { err, location },
-                    &self.reads[read_id].journal,
-                    binding.state_key(),
-                    "transcoding backfill documents",
-                ));
-            }
-            Ok(transcoded) => transcoded,
-        };
-
-        if !lines_batch.content.is_empty() {
-            read.as_mut().put_back(lines_batch.content.into());
-        }
-
-        let metas = super::read::extract_metas(
-            &transcoded,
-            &binding.source_uuid_ptr,
-            &mut self.validators[self.reads[read_id].binding_index as usize],
-            &self.reads[read_id].journal,
-        )?;
-
-        let mut doc_tail = transcoded.into_iter();
-        let mut meta_tail = metas.into_iter();
-        let (doc, _) = doc_tail.next().expect("non-empty transcoded");
-        let meta = meta_tail.next().expect("non-empty metas");
-
-        let ready_read = ReadyRead {
-            doc,
-            meta,
-            doc_tail,
-            meta_tail,
-            inner: read,
-        };
-        self.ready_read_heap.push(ReadyReadEntry {
-            priority: binding.priority,
-            adjusted_clock: ready_read.meta.clock + binding.read_delay,
-            inner: Some(Box::new(ready_read)),
-        });
-
-        Ok(())
-    }
-
-    /// Release a read's gapped and backfilling state (its journal was removed,
-    /// or the session is ending). Drops any parked main read and emits a
-    /// release event per gap. Any in-flight historical read is cancelled by the
-    /// caller dropping its stream.
-    fn release_read_gaps(&mut self, read_id: usize, reason: &'static str) {
-        let read_key = read_id as u32;
-        let had_parked = self.parked_mains.remove(&read_key).is_some();
-
-        if self.reads[read_id].gaps.is_empty() && !had_parked {
-            return;
-        }
-
-        let session_id = self.topology.session_id;
-        let read_state = &self.reads[read_id];
-        for (producer, gap) in read_state.gaps.iter() {
-            service_kit::event!(
-                tracing::Level::INFO,
-                "gap",
-                session = session_id,
-                read_id,
-                binding = read_state.binding_index,
-                journal = read_state.journal.to_string(),
-                producer = service_kit::event::debug(*producer),
-                gap_begin = gap.gap_begin(),
-                "{}",
-                reason,
-            );
-        }
-        self.reads[read_id].gaps.clear();
-        self.refresh_gapped_gauge();
-    }
-
     /// Try to send Flush requests to all log channels (all-or-nothing).
     /// Returns `Err(tx)` with the sender that lacked capacity.
     fn try_log_request_flush_tx(
@@ -1604,7 +972,7 @@ impl SliceActor {
 
     /// Try to send Append requests to target log channels (all-or-nothing).
     /// Returns `Err(tx)` with the sender that lacked capacity.
-    fn try_log_request_append_tx(
+    pub(super) fn try_log_request_append_tx(
         binding: &crate::Binding,
         buffers: &mut Buffers,
         journal: &str,

@@ -36,12 +36,6 @@ struct TestCase {
     num_shards: usize,
     num_producers: usize,
     rounds: Vec<Round>,
-    /// When true, the shard topology routes to a Service with re-read bound
-    /// B = 0, which always skips ahead to the checkpoint maximum M — so a stale
-    /// open span surviving a crash is gapped and recovered via backfill. When
-    /// false, an unbounded B reproduces the conservative min-uncommitted-begin
-    /// strategy.
-    b_zero: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -63,7 +57,7 @@ enum Action {
     /// open span in the recovery checkpoint — the gapped-producer case.
     ContinueOnly { continues: Vec<PartitionId> },
     /// Commit a previously-opened span with an ACK. Only valid for a producer
-    /// with an open span. Under B = 0 across a crash, this triggers a backfill.
+    /// with an open span. Across a crash, this triggers a backfill.
     CommitOpen,
 }
 
@@ -158,7 +152,6 @@ impl Arbitrary for TestCase {
             num_shards,
             num_producers,
             rounds,
-            b_zero: bool::arbitrary(g),
         }
     }
 
@@ -182,11 +175,7 @@ struct SharedHarness {
     journal_client: gazette::journal::Client,
     /// Path to the gazette fragment store, used by reset_data_plane.
     fragment_root: std::path::PathBuf,
-    /// Service with an unbounded re-read bound B (conservative recovery).
     service: shuffle::Service,
-    /// Service with B = 0, which skips ahead to M and recovers stale open spans
-    /// via backfill. Runs its own gRPC server on a distinct endpoint.
-    service_b0: shuffle::Service,
     materialization_spec: flow::MaterializationSpec,
     capture_spec: flow::CaptureSpec,
     log_dir: tempfile::TempDir,
@@ -216,117 +205,80 @@ fn get_harness() -> &'static SharedHarness {
             .build()
             .expect("build tokio runtime");
 
-        let (
-            data_plane,
-            service,
-            service_b0,
-            materialization_spec,
-            capture_spec,
-            log_dir,
-            server_handle,
-        ) = runtime.block_on(async {
-            let source = build::arg_source_to_url("./tests/shuffle_fuzz.flow.yaml", false).unwrap();
-            let build_output = Arc::new(
-                build::for_local_test(&source, true)
+        let (data_plane, service, materialization_spec, capture_spec, log_dir, server_handle) =
+            runtime.block_on(async {
+                let source =
+                    build::arg_source_to_url("./tests/shuffle_fuzz.flow.yaml", false).unwrap();
+                let build_output = Arc::new(
+                    build::for_local_test(&source, true)
+                        .await
+                        .into_result()
+                        .expect("build catalog fixture"),
+                );
+
+                let materialization_spec = build_output
+                    .built
+                    .built_materializations
+                    .get_by_key(&models::Materialization::new(
+                        "testing/fuzz-materialization",
+                    ))
+                    .expect("built materialization")
+                    .spec
+                    .as_ref()
+                    .expect("materialization spec")
+                    .clone();
+
+                let capture_spec = build_output
+                    .built
+                    .built_captures
+                    .get_by_key(&models::Capture::new("testing/fuzz-capture"))
+                    .expect("built capture")
+                    .spec
+                    .as_ref()
+                    .expect("capture spec")
+                    .clone();
+
+                let data_plane = e2e_support::DataPlane::start(Default::default())
                     .await
-                    .into_result()
-                    .expect("build catalog fixture"),
-            );
+                    .expect("DataPlane start");
 
-            let materialization_spec = build_output
-                .built
-                .built_materializations
-                .get_by_key(&models::Materialization::new(
-                    "testing/fuzz-materialization",
-                ))
-                .expect("built materialization")
-                .spec
-                .as_ref()
-                .expect("materialization spec")
-                .clone();
-
-            let capture_spec = build_output
-                .built
-                .built_captures
-                .get_by_key(&models::Capture::new("testing/fuzz-capture"))
-                .expect("built capture")
-                .spec
-                .as_ref()
-                .expect("capture spec")
-                .clone();
-
-            let data_plane = e2e_support::DataPlane::start(Default::default())
-                .await
-                .expect("DataPlane start");
-
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-                .await
-                .expect("bind shuffle server");
-            let endpoint = format!("http://{}", listener.local_addr().unwrap());
-
-            let factory: gazette::journal::ClientFactory = Arc::new({
-                let journal_client = data_plane.journal_client.clone();
-                move |_authz_sub, _authz_obj| journal_client.clone()
-            });
-            let service = shuffle::Service::new(
-                endpoint,
-                factory,
-                10 * 1024 * 1024 * 1024,
-                // Unbounded re-read bound "B": conservative recovery.
-                u64::MAX,
-                service_kit::Registry::new(),
-                None, // Tests run the shuffle fan-out unauthenticated.
-            );
-
-            let server = service.clone().build_tonic_server();
-            let server_handle = tokio::spawn(async move {
-                let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
-                server
-                    .serve_with_incoming(incoming)
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
                     .await
-                    .expect("shuffle server error")
-            });
+                    .expect("bind shuffle server");
+                let endpoint = format!("http://{}", listener.local_addr().unwrap());
 
-            // A second service with B = 0, exercised by test cases with
-            // `b_zero`, so stale open spans surviving a crash are recovered
-            // via backfill rather than a conservative re-read.
-            let listener_b0 = tokio::net::TcpListener::bind("127.0.0.1:0")
-                .await
-                .expect("bind B=0 shuffle server");
-            let endpoint_b0 = format!("http://{}", listener_b0.local_addr().unwrap());
-            let factory_b0: gazette::journal::ClientFactory = Arc::new({
-                let journal_client = data_plane.journal_client.clone();
-                move |_authz_sub, _authz_obj| journal_client.clone()
-            });
-            let service_b0 = shuffle::Service::new(
-                endpoint_b0,
-                factory_b0,
-                10 * 1024 * 1024 * 1024,
-                0, // B = 0.
-                service_kit::Registry::new(),
-                None,
-            );
-            let server_b0 = service_b0.clone().build_tonic_server();
-            tokio::spawn(async move {
-                let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener_b0);
-                server_b0
-                    .serve_with_incoming(incoming)
-                    .await
-                    .expect("B=0 shuffle server error")
-            });
+                let factory: gazette::journal::ClientFactory = Arc::new({
+                    let journal_client = data_plane.journal_client.clone();
+                    move |_authz_sub, _authz_obj| journal_client.clone()
+                });
+                let service = shuffle::Service::new(
+                    endpoint,
+                    factory,
+                    10 * 1024 * 1024 * 1024,
+                    service_kit::Registry::new(),
+                    None, // Tests run the shuffle fan-out unauthenticated.
+                );
 
-            let log_dir = tempfile::tempdir().expect("create temp dir");
+                let server = service.clone().build_tonic_server();
+                let server_handle = tokio::spawn(async move {
+                    let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
+                    server
+                        .serve_with_incoming(incoming)
+                        .await
+                        .expect("shuffle server error")
+                });
 
-            (
-                data_plane,
-                service,
-                service_b0,
-                materialization_spec,
-                capture_spec,
-                log_dir,
-                server_handle,
-            )
-        });
+                let log_dir = tempfile::tempdir().expect("create temp dir");
+
+                (
+                    data_plane,
+                    service,
+                    materialization_spec,
+                    capture_spec,
+                    log_dir,
+                    server_handle,
+                )
+            });
 
         let journal_client = data_plane.journal_client.clone();
         let fragment_root = data_plane.gazette.fragment_root.clone();
@@ -336,7 +288,6 @@ fn get_harness() -> &'static SharedHarness {
             journal_client,
             fragment_root,
             service,
-            service_b0,
             materialization_spec,
             capture_spec,
             log_dir,
@@ -925,12 +876,7 @@ async fn run_test_case_inner(
 
     let mut oracle = Oracle::new();
     let task = build_task(&harness.materialization_spec);
-    // Route the topology to the B=0 or unbounded-B Service per the test case.
-    let service = if test_case.b_zero {
-        &harness.service_b0
-    } else {
-        &harness.service
-    };
+    let service = &harness.service;
     let shards = build_shards(
         test_case.num_shards as u32,
         service.peer_endpoint(),

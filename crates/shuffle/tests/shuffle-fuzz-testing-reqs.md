@@ -182,11 +182,8 @@ will see partial results and the oracle will catch the violation.
 
 ### 5a. Gapped-Producer Recovery (checkpoint skip-ahead + backfill)
 
-Each test case selects a re-read bound `B` (via `b_zero`): either unbounded
-(the conservative min-uncommitted-begin strategy) or `B = 0`, which always
-skips ahead to the checkpoint maximum `M`. The harness runs two shuffle
-`Service`s on distinct endpoints — one per `B` — and routes the case's shard
-topology to the selected one.
+On restart, each read skips ahead to the checkpoint maximum `M`; every
+uncommitted span beginning before `M` is gapped and recovered via backfill.
 
 Two actions create *stale open spans*:
 
@@ -197,17 +194,19 @@ Two actions create *stale open spans*:
   recovery checkpoint.
 - `CommitOpen` later ACKs that span.
 
-Under `B = 0`, a recovered open span beginning before `M` is *gapped*: the main
-read skips it and, when `CommitOpen` arrives, the Slice parks at the ACK,
-backfills the historical range, and delivers the span exactly once, atomically.
-The oracle asserts the same completeness/safety/atomicity invariants across the
-backfill as for any other commit. A producer with an open span must resolve it
+A recovered open span beginning before `M` is *gapped*: the main read skips it
+and, at the first newer document it then reads for that producer (a CONTINUE
+still ahead of `M`, or the `CommitOpen` ACK), the Slice parks at that trigger,
+backfills `[F, trigger)`, and re-presents the trigger to the normal read path —
+which delivers the span exactly once and commits it atomically when the ACK is
+sequenced. The oracle asserts the same completeness/safety/atomicity invariants
+across the backfill as for any other commit. A producer with an open span must resolve it
 (commit or roll back) before writing anything else, and never writes
 `OUTSIDE_TXN` while open (which would be a protocol error against a pending
 span).
 
 Gap formation requires a specific alignment (open span captured in a flushed
-checkpoint, then a crash in a later round, then `CommitOpen` under `B = 0`), so
+checkpoint, then a crash in a later round, then `CommitOpen`), so
 it is opportunistic at the default 100 iterations and reliably exercised at
 higher `QUICKCHECK_TESTS` counts. The deterministic `gapped_backfill` scenario
 in `scenario_fixtures.rs` is the authoritative end-to-end backfill test.

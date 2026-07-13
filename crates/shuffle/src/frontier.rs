@@ -35,12 +35,7 @@ impl ProducerFrontier {
         // A producer's next span begins exactly at its previous transaction's
         // committed end offset whenever no other producer appended in between,
         // so a `+F` span begin routinely ties with the prior committed `-O`
-        // (F == O) — and the span begin is the strictly newer state. Preferring
-        // the committed side would erase the open span from the durable
-        // checkpoint entirely: a later checkpoint-derived restart then has no
-        // entry to gap or re-read, and silently skips the span's documents.
-        // (Rollback resolution is unaffected: a resolving ACK's `-ack_end` is
-        // strictly greater in magnitude than the span begin `F` it clears.)
+        // (F == O) — and the span begin is the strictly newer state.
         let offset = if self.offset.abs() != other.offset.abs() {
             if self.offset.abs() > other.offset.abs() {
                 self.offset

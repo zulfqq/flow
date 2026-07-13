@@ -62,14 +62,6 @@ pub struct Args {
     /// set its own `estuary.dev/shuffle-disk-limit` label. Default is 2 GiB.
     #[arg(long, env = "SHUFFLE_DISK_LIMIT_BYTES", default_value_t = shuffle::DEFAULT_SHUFFLE_DISK_LIMIT_BYTES)]
     pub shuffle_disk_limit_bytes: u64,
-
-    /// Near-frontier conservative re-read bound "B", in bytes, applied when a
-    /// shuffle Slice resolves each read's resume checkpoint. Uncommitted
-    /// producer spans beginning more than this far behind the checkpoint's
-    /// furthest justified position are recovered lazily via targeted backfill
-    /// rather than a whole-journal re-read. Default is 1 GiB.
-    #[arg(long, env = "SHUFFLE_REREAD_BOUND_BYTES", default_value_t = shuffle::DEFAULT_REREAD_BOUND_BYTES)]
-    pub shuffle_reread_bound_bytes: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, clap::ValueEnum)]
@@ -117,7 +109,6 @@ pub async fn run(args: Args, registry: service_kit::Registry) -> anyhow::Result<
         args.peer_endpoint,
         read_factory,
         args.shuffle_disk_limit_bytes,
-        args.shuffle_reread_bound_bytes,
         registry.clone(),
         Some(shuffle_signer),
     );

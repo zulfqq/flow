@@ -67,7 +67,7 @@ pub const FLAGS_SCHEMA_VALID: u16 = 0x8000;
 pub use binding::Binding;
 pub use client::SessionClient;
 pub use frontier::{Frontier, JournalFrontier, ProducerFrontier};
-pub use service::{DEFAULT_REREAD_BOUND_BYTES, DEFAULT_SHUFFLE_DISK_LIMIT_BYTES, Service};
+pub use service::{DEFAULT_SHUFFLE_DISK_LIMIT_BYTES, Service};
 
 /// Return the current wall-clock time as a `uuid::Clock`.
 ///
@@ -227,18 +227,4 @@ const ACTOR_TICKER_INTERVAL: std::time::Duration = std::time::Duration::from_sec
 /// unresolved hint — before the Session actor tears down the session. It's
 /// decoupled from [`ACTOR_TICKER_INTERVAL`] (the tracing cadence) and enforced
 /// via mark-and-sweep over that many ticks. See `session::state::CheckpointPipeline`.
-///
-/// Accepted-risk interaction with gapped-producer backfill: a recovery
-/// checkpoint whose hinted producer is *gapped* resolves that hint only through
-/// the backfill's single atomic final flush — there is no incremental
-/// `last_commit` advancement to reset the stall counter. A backfill taking
-/// longer than this horizon hits the timeout and the next session repeats it, a
-/// restart livelock confined to very large (tens-of-GB, cold-storage) backfills.
-/// This ceiling is accepted for the initial landing: today's conservative
-/// re-read has the same shape (a long catch-up before the hinted ACK with no
-/// other unresolved progress), the horizon was recently raised from ~2m to give
-/// slow resolution room, and the new backfill events/metrics plus the existing
-/// stall WARN make the failure diagnosable. A heartbeat mitigation (periodically
-/// re-reporting the backfilling producer's unchanged entry to keep the hint
-/// "alive") stays within "no protocol change" but is deferred.
 const CAUSAL_HINT_RESOLUTION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15 * 60);

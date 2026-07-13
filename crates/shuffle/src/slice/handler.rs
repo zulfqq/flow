@@ -142,7 +142,6 @@ where
         bindings,
         journal_clients,
         hint_index,
-        reread_bound_bytes: service.reread_bound_bytes,
     };
 
     handler.set_phase("running");
@@ -161,7 +160,7 @@ where
         pending_reads: stream::FuturesUnordered::new(),
         parser: simd_doc::SimdParser::new(1_000_000),
         ready_read_heap: ReadyReadHeap::new(),
-        parked_mains: Default::default(),
+        backfills: Default::default(),
         pending_backfills: stream::FuturesUnordered::new(),
         tailing_reads: 0,
         stalled_reads: Default::default(),

@@ -1,4 +1,3 @@
-use super::gap::GapState;
 use super::producer::ProducerState;
 use crate::ProducerMap;
 use proto_gazette::{broker, uuid};
@@ -21,12 +20,13 @@ pub struct ReadState {
     /// Producers updated since the last flush cycle started.
     /// Drained into `settled` at the start of each flush.
     pub pending: ProducerMap<ProducerState>,
-    /// Producers classified as gapped during checkpoint recovery, and their
-    /// in-session backfill state. A gapped producer's frozen `ProducerState`
-    /// remains in `settled` (its single source of truth for `last_commit`),
-    /// while this map tracks the skipped span and any active backfill. Empty in
-    /// the common case where no producer was gapped.
-    pub gaps: ProducerMap<GapState>,
+    /// Producers classified as gapped during checkpoint recovery, mapped to
+    /// their pinned skipped-span begin offset `F`. A gapped producer's frozen
+    /// `ProducerState` remains in `settled` (its single source of truth for
+    /// `last_commit`); this map only pins `F`. Live backfill sequencing state
+    /// lives in the actor's `Backfill` (see `gap.rs`), not here, keeping this
+    /// snapshot-testable. Empty in the common case where no producer was gapped.
+    pub gaps: ProducerMap<i64>,
     /// End offset of most recently processed document.
     pub read_offset: i64,
     /// Read offset as of last flush (baseline for bytes_read_delta).
@@ -44,7 +44,7 @@ impl ReadState {
         binding_index: u16,
         journal: Box<str>,
         settled: ProducerMap<ProducerState>,
-        gaps: ProducerMap<GapState>,
+        gaps: ProducerMap<i64>,
     ) -> Self {
         Self {
             binding_index,
@@ -242,6 +242,91 @@ pub async fn probe_read_start(
             Some(Ok(resp)) => return Ok((resp.offset, resp.write_head, resp.header)),
         }
     }
+}
+
+/// Classification of a `ReadLines` failure, shared by the main and backfill
+/// read paths. Only the classification is shared; each caller keeps its own
+/// distinct reactions (events, metrics, gap release vs backfill completion).
+pub enum ReadFailure {
+    /// The journal was deleted or fully suspended — no fragments remain. Carries
+    /// the broker status (`JournalNotFound` or `Suspended`); each caller renders
+    /// it into its own event message via `Status::as_str_name`.
+    JournalRemoved(broker::Status),
+    /// A transient error; the caller re-parks the read to retry. Carries the
+    /// error for the caller's log event.
+    Transient(gazette::Error),
+    /// A terminal error; the caller fails. Carries the error for `map_read_error`.
+    Terminal(gazette::Error),
+}
+
+/// Classify a `ReadLines` error into the outcome the caller must react to.
+/// JournalNotFound and Suspended both mean "no fragments remain"; the status is
+/// carried through so each caller can render it into its own event message.
+pub fn classify_read_failure(err: gazette::Error) -> ReadFailure {
+    match err {
+        gazette::Error::BrokerStatus(
+            status @ (broker::Status::JournalNotFound | broker::Status::Suspended),
+        ) => ReadFailure::JournalRemoved(status),
+        err if err.is_transient() => ReadFailure::Transient(err),
+        err => ReadFailure::Terminal(err),
+    }
+}
+
+/// Parse a `LinesBatch` into a `ReadyRead`: transcode to archived documents, put
+/// any unparsed remainder back onto `read`, extract and validate per-document
+/// metadata, and pair the head document with its metadata (its tail rides along
+/// in the returned `ReadyRead`). Pure processing, no IO.
+///
+/// `context` labels a transcode error ("transcoding documents" for a main read,
+/// "transcoding backfill documents" for a historical read).
+pub fn parse_lines_batch(
+    parser: &mut simd_doc::SimdParser,
+    validator: &mut doc::Validator,
+    binding: &crate::Binding,
+    journal: &str,
+    mut read: super::ReadLines,
+    mut lines_batch: gazette::journal::read::LinesBatch,
+    context: &'static str,
+) -> anyhow::Result<ReadyRead> {
+    let transcoded = match simd_doc::transcode_many(
+        parser,
+        &mut lines_batch.content,
+        &mut lines_batch.offset,
+        Default::default(),
+    ) {
+        Err((err, location)) => {
+            return Err(map_read_error(
+                gazette::Error::Parsing { err, location },
+                journal,
+                binding.state_key(),
+                context,
+            ));
+        }
+        Ok(transcoded) => transcoded,
+    };
+
+    // There may be a remainder if we failed to parse partway through.
+    // Put it back to handle it next time.
+    if !lines_batch.content.is_empty() {
+        read.as_mut().put_back(lines_batch.content.into());
+    }
+
+    let metas = extract_metas(&transcoded, &binding.source_uuid_ptr, validator, journal)?;
+
+    // Consume into owned documents and pair with pre-extracted metadata.
+    let mut doc_tail = transcoded.into_iter();
+    let mut meta_tail = metas.into_iter();
+
+    let (doc, _) = doc_tail.next().expect("non-empty transcoded");
+    let meta = meta_tail.next().expect("non-empty metas");
+
+    Ok(ReadyRead {
+        doc,
+        meta,
+        doc_tail,
+        meta_tail,
+        inner: read,
+    })
 }
 
 /// Map a non-transient gazette Error into an anyhow::Error with context.
