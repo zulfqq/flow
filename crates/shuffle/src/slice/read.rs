@@ -20,13 +20,6 @@ pub struct ReadState {
     /// Producers updated since the last flush cycle started.
     /// Drained into `settled` at the start of each flush.
     pub pending: ProducerMap<ProducerState>,
-    /// Producers classified as gapped during checkpoint recovery, mapped to
-    /// their pinned skipped-span begin offset `F`. A gapped producer's frozen
-    /// `ProducerState` remains in `settled` (its single source of truth for
-    /// `last_commit`); this map only pins `F`. Live backfill sequencing state
-    /// lives in the actor's `Backfill` (see `gap.rs`), not here, keeping this
-    /// snapshot-testable. Empty in the common case where no producer was gapped.
-    pub gaps: ProducerMap<i64>,
     /// End offset of most recently processed document.
     pub read_offset: i64,
     /// Read offset as of last flush (baseline for bytes_read_delta).
@@ -38,20 +31,19 @@ pub struct ReadState {
 }
 
 impl ReadState {
-    /// Construct a `ReadState` for a read with `settled` producers and `gaps`
-    /// recovered from its checkpoint.
+    /// Construct a `ReadState` from `settled` producers recovered from its
+    /// checkpoint. Gapped producers carry their `gapped` bit set within `settled`
+    /// (see `ProducerState::gapped`); there is no separate gap map.
     pub fn recovered(
         binding_index: u16,
         journal: Box<str>,
         settled: ProducerMap<ProducerState>,
-        gaps: ProducerMap<i64>,
     ) -> Self {
         Self {
             binding_index,
             journal,
             settled,
             pending: Default::default(),
-            gaps,
             read_offset: 0,
             prev_read_offset: 0,
             write_head: 0,

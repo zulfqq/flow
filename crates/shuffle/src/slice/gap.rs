@@ -1,83 +1,77 @@
-//! Gapped-producer recovery: state, pure transitions, and actor orchestration.
+//! Gapped-producer recovery: pure transitions and actor orchestration.
 //!
 //! On restart, a `(binding, journal)` read starts at the furthest journal
 //! position justified by its checkpoint: the maximum offset magnitude `M`
 //! across producer entries. An uncommitted producer span whose begin offset
 //! `F` falls before `M` is *gapped*: the main read skips `[F, M)` and the
-//! producer is frozen until it resolves. See
-//! `plans/shuffle-gapped-restart.md` §Producer state machine.
+//! producer is frozen until it resolves. A gapped entry is marked in-memory by
+//! `ProducerState::gapped`; while set, its `offset` is the pinned `F`. See
+//! `plans/shuffle-gapped-restart.md` §Producer state machine and §Gapped state.
 //!
-//! `ReadState::gaps` is a plain `producer -> F` map: a gapped producer's frozen
-//! `ProducerState` lives in `settled` (its source of truth for `last_commit`)
-//! and the map only pins the skipped span's begin offset `F`. The first newer
-//! main-read document of a gapped producer (a CONTINUE or ACK with `clock >
-//! last_commit`) is the *trigger*: the main read parks at it and the actor opens
-//! a bounded historical read of `[F, trigger.begin)`. All live sequencing state
-//! for the recovery is consolidated in a single actor-owned `Backfill`
-//! (`SliceActor::backfill`). The gap entry is retained for the whole backfill
-//! (its pinned `F` is read at completion for the range event); while parked it is
-//! inert, as the main read produces no documents.
+//! The first newer main-read document of a gapped producer (a CONTINUE or ACK
+//! with `clock > last_commit`) is the *trigger*. At trigger time the actor:
 //!
-//! A backfill blocks all main-read → Log I/O for the whole Slice until it
-//! completes: triggers are discovered only by sequencing the ready heap's top,
-//! and the heap does not drain while a backfill is active (see the gate in
-//! `SliceActor::try_log_request_tx`). This makes **at most one backfill per
+//! 1. reconstructs the recovered open span directly into the read's ordinary
+//!    `pending` map as `{last_commit, max_continue: 0, offset: F, gapped: false}`
+//!    — this both installs the span and clears the gapped marker; and
+//! 2. opens a bounded historical read of `[F, trigger.begin)`, held in the single
+//!    actor-owned `Backfill` (`SliceActor::backfill`).
+//!
+//! There is no separate live sequencing state: the backfill drain
+//! (`try_drain_backfill`) sequences historical target-producer documents against
+//! the ordinary pending-else-settled lookup and commits results back into
+//! `pending`, exactly the normal path's discipline. Sequencing is
+//! pure/speculative and committed only after the append is sent, so a retry after
+//! a full Log channel re-sequences from the same snapshot.
+//!
+//! **The trigger stays put.** It is never popped or shelved: it remains buffered
+//! at the head of its read in the ready heap for the whole backfill. The heap does
+//! not drain while a backfill is active (see the gate in
+//! `SliceActor::try_log_request_tx`), so leaving it in place is behaviorally
+//! identical to popping and re-pushing. This makes **at most one backfill per
 //! Slice, globally**, a structural invariant — no second trigger can be reached
 //! while one is in flight. It parallels both the all-reads-tailing stalled-read
 //! gate and the legacy conservative restart (which re-read `[F, …)` on a
 //! non-tailing main read, blocking all draining anyway).
 //!
-//! This module is organized like `state.rs`: a pure decision layer
-//! (`begin_backfill`, `backfill_read_request`, `sequence_backfill_document` —
-//! directly unit-tested) and an orchestration layer (an `impl SliceActor`
-//! extension block driving the backfill lifecycle around those pure routines).
-//! A gapped producer's main-read documents are *classified* in
-//! `state::sequence_document` (which returns `Sequenced::Park` for the trigger
-//! and folds the other gapped outcomes into a plain `SequencedDoc`); the drain
-//! loop applies that decision, calling `park_backfill` then `start_backfill` on
-//! a trigger and resolving/removing the gap post-pop for a rollback or newer
-//! OUTSIDE commit. The actor owns the IO objects (parked main read, in-flight
-//! historical read, batch cursor); `ReadState` holds only the pinned `F`, which
-//! keeps it snapshot-testable, following the crate's decomposition convention.
+//! **Completion commits and installs nothing** — the span was installed at
+//! trigger time. When the historical read reaches `trigger.begin`, the backfill
+//! is simply cleared and its completion is reported. The next drain iteration
+//! pops the trigger — now that the producer is no longer gapped and its `pending`
+//! state is the reconstructed span — and sequences it through the wholly-normal
+//! path: a CONTINUE extends the span and appends, an ACK commits it (causal hints,
+//! committed offset, flush) via the existing normal-path code.
 //!
-//! Backfill *completion commits nothing* — the core simplification. When the
-//! historical read reaches `trigger.begin`, the reconstructed span (`live`) is
-//! installed into the read's `pending` map, the gap is removed, and the parked
-//! trigger is re-presented to the ready heap with its head document unconsumed.
-//! The drain loop re-pops it and sequences it through the wholly-normal path:
-//! the producer is no longer gapped, so a CONTINUE trigger extends the span and
-//! appends, while an ACK trigger commits it — causal hints, committed offset,
-//! and flush — via the existing normal-path code. Installing `live` is safe
-//! because its `offset` is the span begin `F`, identical to what the durable
-//! checkpoint already records, so a flush carrying it changes nothing durably;
-//! an open uncommitted span is a state every existing mechanism already handles,
-//! and visibility stays gated by the absence of an ACK exactly as for any normal
-//! mid-span producer. There is thus no atomic visibility boundary to enforce:
-//! transaction atomicity is inherited from normal ACK-gated visibility, and a
-//! crash before the eventual ACK flush recovers the unchanged positive `F`,
-//! re-creates the gap, and repeats idempotently.
+//! This is durably safe because `max_continue` is NOT persisted in
+//! `ProducerFrontier`, and the checkpoint's `F` is by definition the first pending
+//! CONTINUE's begin offset, so a recovering `ContinueBeginSpan` re-derives
+//! `offset = F`. An interim flush mid-backfill therefore carries exactly the
+//! `(last_commit, F)` the durable checkpoint already records; a crash mid-backfill
+//! recovers the unchanged positive `F` and re-gaps idempotently. (On fragment loss
+//! the first found document begins at `F' > F`; if that `F'` leaks to a durable
+//! base and the session then crashes, recovery re-gaps at `F'`, and `[F, F')` was
+//! unreadable anyway — self-consistent.)
+//!
+//! This module follows the crate's decomposition convention: a pure decision layer
+//! (`backfill_read_request`, and `state::sequence_gapped` / `state::sequence_producer`
+//! which it leans on — all directly unit-tested) and an orchestration layer (an
+//! `impl SliceActor` extension block driving the backfill lifecycle). The actor
+//! owns the IO objects (in-flight historical read, batch cursor); `ReadState` holds
+//! only ordinary producer state, which keeps it snapshot-testable.
 //!
 //! Backfilled documents do NOT flow through the ready heap; they are appended
-//! directly. The historical-vs-trigger direct-append justification is that the
-//! trigger was sequenced to `Sequenced::Park` only after clearing the drain
-//! loop's clock-delay gate, so — same binding read-delay, and strictly-ascending
-//! per-producer clocks — every historical CONTINUE in `[F, trigger.begin)` has
-//! an adjusted clock already in the past. Heap ordering, priority ordering, and
-//! clock-delay gating are therefore provably no-ops for them; only the
-//! Log-append semantics matter (per-producer journal order preserved, and the
-//! one-transaction invariant enforced: no committing document appears inside the
-//! historical range).
-//!
-//! Ordering *relative to other journals* is trivially preserved because the
-//! Slice blocks all other draining for the backfill's duration: no other
-//! journal's document is appended while the backfill runs, so none can overtake
-//! the parked trigger. The only residual, user-visible relaxation is the one
-//! inherent to any recovery — backfilled documents are older than documents
-//! already appended before the restart — and that inversion window no longer
-//! grows during the backfill.
+//! directly. The trigger was sequenced (to start the backfill) only after clearing
+//! the drain loop's clock-delay gate, so — same binding read-delay, and
+//! strictly-ascending per-producer clocks — every historical CONTINUE in
+//! `[F, trigger.begin)` has an adjusted clock already in the past. Heap ordering,
+//! priority ordering, and clock-delay gating are therefore provable no-ops for
+//! them; only the Log-append semantics matter (per-producer journal order
+//! preserved, and the one-transaction invariant enforced: no committing document
+//! appears inside the historical range). Ordering *relative to other journals* is
+//! trivially preserved because the Slice blocks all other draining for the
+//! backfill's duration.
 
 use super::actor::{Buffers, SliceActor};
-use super::heap::ReadyReadEntry;
 use super::producer::ProducerState;
 use super::read::{self, Meta, ReadyRead};
 use super::state;
@@ -87,38 +81,28 @@ use proto_gazette::{broker, uuid};
 use tokio::sync::mpsc;
 
 /// All live state for the single active backfill of a gapped producer's pending
-/// transaction, owned by the actor in `SliceActor::backfill`. Consolidates what
-/// the heap-routed design split across three homes: the parked main read, the
-/// live target-producer sequencing state, and the in-flight historical read.
+/// transaction, owned by the actor in `SliceActor::backfill`.
+///
 /// At most one backfill exists per Slice, globally — a structural invariant, not
 /// a per-read one: the heap does not drain while a backfill is active, so no
-/// second trigger can be discovered until this one completes.
-///
-/// While the backfill runs the producer's `ReadState::gaps` entry is retained
-/// but inert: the main read is parked, so no main-read document of the journal
-/// arrives and the pinned `F` cannot change. It is removed only at completion,
-/// rollback/OUTSIDE resolution, or release.
+/// second trigger can be discovered until this one completes. It holds only the
+/// in-flight historical read (`io`) and the bookkeeping needed to report
+/// completion; the reconstructed open span lives in the read's ordinary `pending`
+/// map (installed at trigger time), and the trigger itself stays buffered at the
+/// head of its read in the ready heap.
 pub struct Backfill {
-    /// Read id of the parked main read (index into `SliceActor::reads`).
+    /// Read id of the read whose gapped producer triggered this backfill (index
+    /// into `SliceActor::reads`). Its trigger document stays at the head of the
+    /// ready heap for the whole backfill.
     pub read_key: u32,
-    /// The shelved main read, its head document the *trigger* (the gapped
-    /// producer's first newer CONTINUE or ACK). Held here (outside
-    /// `pending_reads`), so no later document of the journal is reachable while
-    /// parked, and — because a backfill blocks all draining — no other journal's
-    /// document is appended ahead of it. At completion it is re-presented to the
-    /// ready heap with its head unconsumed (`parked.meta` IS the trigger) and
-    /// sequenced through the normal path.
-    pub parked: Box<ReadyRead>,
     /// The gapped producer whose newer document triggered this backfill.
     pub target: uuid::Producer,
-    /// Live sequencing state for historical target-producer documents,
-    /// reconstructed from the recovered `{last_commit, max_continue: 0, offset:
-    /// F}`. At completion it is installed into the read's `pending` map as the
-    /// reconstructed open span. That is safe because its `offset` stays at the
-    /// span begin `F` (the durable checkpoint already records `F`), so any flush
-    /// carrying it changes nothing durably and visibility stays gated by the
-    /// absence of an ACK — exactly as for any normal mid-span producer.
-    pub live: ProducerState,
+    /// `F`, the recovered span begin; retained for the completion range event.
+    /// The reconstructed span was installed into `pending` at `offset = F`.
+    pub gap_begin: i64,
+    /// `trigger.begin`, the historical read's exclusive end; retained with
+    /// `gap_begin` for the completion range event.
+    pub trigger_begin: i64,
     /// The historical read's I/O state: either awaiting its next batch
     /// (`Reading`) or draining a resolved batch document-by-document
     /// (`Draining`). This two-state machine makes "the inner read is re-polled
@@ -147,19 +131,6 @@ pub enum BackfillIo {
     Draining(Box<ReadyRead>),
 }
 
-/// Reconstruct a triggered backfill's live sequencing state from the recovered
-/// checkpoint: the pending span begins at `F` (`gap_begin`) with the recovered
-/// `last_commit` and `max_continue: 0`. Installed into `pending` at completion
-/// as the reconstructed open span; its `offset` stays at `F`, so a flush
-/// carrying it matches the durable checkpoint and changes nothing.
-pub(super) fn begin_backfill(gap_begin: i64, recovered_last_commit: uuid::Clock) -> ProducerState {
-    ProducerState {
-        last_commit: recovered_last_commit,
-        max_continue: uuid::Clock::zero(),
-        offset: gap_begin,
-    }
-}
-
 /// Build the bounded, non-blocking historical read of
 /// `[gap_begin, trigger_begin)` for a triggered backfill. Same `begin_mod_time`
 /// and partition-filtered journal as the main read; no write-head probe is
@@ -183,84 +154,66 @@ pub(super) fn backfill_read_request(
     }
 }
 
-/// Sequence a historical backfill document of the target producer against the
-/// gap's `live` state, enforcing the one-transaction invariant: the recovered
-/// span holds no committed transaction boundary, so any commit inside
-/// `[F, trigger.begin)` contradicts the recovered checkpoint. For a CONTINUE
-/// trigger this holds because `[F, M)` has no target-producer ACK by checkpoint
-/// closure and `[M, trigger.begin)` has no target document at all (the read
-/// parked at the first one).
-pub(super) fn sequence_backfill_document(
-    live: ProducerState,
-    journal: &str,
-    binding: &crate::Binding,
-    meta: &Meta,
-) -> anyhow::Result<state::SequencedDoc> {
-    let sequenced = state::sequence_producer(live, journal, binding, meta)?;
-
-    // One-transaction invariant: the recovered span holds no committed
-    // transaction boundary, so any commit inside `[F, trigger.begin)`
-    // contradicts the recovered checkpoint.
-    if sequenced.is_commit {
-        anyhow::bail!(
-            "backfill of journal {} (binding {}) hit an unexpected committing document at \
-             offset {} for target producer {:?}: a distinct transaction boundary inside the \
-             historical range contradicts the recovered checkpoint",
-            journal,
-            binding.state_key(),
-            meta.begin_offset,
-            meta.producer,
-        );
-    }
-
-    Ok(sequenced)
-}
-
-/// The parked trigger and reconstructed sequencing state produced by
-/// `park_backfill` and consumed by `start_backfill` to assemble the `Backfill`.
-/// The drain loop calls the two back-to-back, so this never crosses an await;
-/// it exists only because a `Backfill` cannot be constructed until
-/// `start_backfill` opens the historical read that its `io` field owns.
-pub(super) struct ParkedTrigger {
-    /// The shelved main read; `parked.meta` is the trigger.
-    parked: Box<ReadyRead>,
-    /// The gapped producer whose newer document triggered the backfill.
-    target: uuid::Producer,
-    /// Reconstructed live sequencing state; `live.offset` is the span begin `F`.
-    live: ProducerState,
-}
-
 impl SliceActor {
-    /// Park the main read at a gapped producer's *trigger* (its first newer
-    /// CONTINUE or ACK): pop and shelve the whole `ReadyRead` (its head IS the
-    /// trigger, and no later document of the journal is reachable while parked),
-    /// and reconstruct the live sequencing state. The trigger is NOT sequenced
-    /// now; at completion it is re-presented to the ready heap and sequenced
-    /// through the normal path against the reconstructed span (spec §Trigger and
-    /// parking).
+    /// Begin a backfill for a gapped producer's *trigger* (its first newer
+    /// CONTINUE or ACK, the current ready-heap head). The trigger is NOT sequenced
+    /// now and is NOT popped: it stays buffered at the head of its read in the
+    /// ready heap, and the `backfill.is_some()` gate in `try_log_request_tx` parks
+    /// the whole Slice until this backfill completes (spec §Trigger and parking).
     ///
-    /// Paired with `start_backfill`, which opens the historical read and installs
-    /// the `Backfill`: the drain loop calls the two back-to-back. Because a
-    /// backfill blocks all heap draining, `Sequenced::Park` is only ever reached
-    /// while no backfill is active, so a fresh one can always be installed.
-    pub(super) fn park_backfill(&mut self, read_key: u32, meta: &Meta) -> ParkedTrigger {
+    /// `gap_begin` (`F`) and `recovered_last_commit` come from the drain loop's
+    /// single pending-else-settled lookup of the frozen entry, so no second lookup
+    /// is performed for the trigger document.
+    ///
+    /// Reconstructs the recovered open span directly into the read's ordinary
+    /// `pending` map, which both installs the span and clears the gapped marker.
+    /// The backfill drain and the eventual re-sequenced trigger then advance this
+    /// ordinary state; there is no separate `live`. Because a backfill blocks all
+    /// heap draining, this is only ever reached while no backfill is active, so a
+    /// fresh one can always be installed.
+    pub(super) fn start_backfill(
+        &mut self,
+        read_key: u32,
+        trigger: &Meta,
+        gap_begin: i64,
+        recovered_last_commit: uuid::Clock,
+    ) -> anyhow::Result<()> {
         let read_id = read_key as usize;
+        let trigger_begin = trigger.begin_offset;
+        let target = trigger.producer;
 
-        let parked = self.ready_read_heap.pop().unwrap().inner.unwrap();
+        // Freeze invariant: while gapped, `offset` is the pinned `F` (>= 0), and
+        // only the four resolutions (trigger, clean rollback, deep rollback, newer
+        // OUTSIDE) clear the bit. A trigger is one of them.
+        debug_assert!(
+            gap_begin >= 0,
+            "a gapped entry's offset is the pinned begin offset F",
+        );
+        // The range is always non-empty: `F < M <= trigger_begin`. The main read
+        // starts at M and reaches the trigger at or after M, while a gapped span
+        // begin F is strictly below M.
+        assert!(
+            gap_begin < trigger_begin,
+            "backfill range [{gap_begin}, {trigger_begin}) must be non-empty: F precedes M, \
+             which is at-or-below the trigger",
+        );
 
-        // The gap entry stays in `ReadState::gaps` for the whole backfill (its
-        // pinned `F` is read at completion for the range event; removed at
-        // completion or on release); while parked it's inert because no main-read
-        // document of the journal arrives.
-        let gap_begin = *self.reads[read_id]
-            .gaps
-            .get(&meta.producer)
-            .expect("producer is gapped");
-        let recovered_last_commit = self.reads[read_id]
-            .settled
-            .get(&meta.producer)
-            .map(|ps| ps.last_commit)
-            .unwrap_or_default();
+        // Reconstruct the recovered open span into `pending`, clearing the gapped
+        // marker (the reconstructed entry has `gapped: false` and shadows the
+        // frozen `settled` entry via pending-else-settled lookup, draining into
+        // `settled` at the next flush). Durably safe: `max_continue` is not
+        // persisted and `offset` stays at `F`, so an interim flush mid-backfill
+        // carries exactly the `(last_commit, F)` the checkpoint already records,
+        // and a crash re-derives the gap and re-triggers idempotently.
+        _ = self.reads[read_id].pending.insert(
+            target,
+            ProducerState {
+                last_commit: recovered_last_commit,
+                max_continue: uuid::Clock::zero(),
+                offset: gap_begin,
+                gapped: false,
+            },
+        );
 
         let binding = &self.topology.bindings[self.reads[read_id].binding_index as usize];
         service_kit::event!(
@@ -270,56 +223,19 @@ impl SliceActor {
             read_id,
             binding = binding.index,
             journal = self.reads[read_id].journal.to_string(),
-            producer = service_kit::event::debug(meta.producer),
+            producer = service_kit::event::debug(target),
             gap_begin, // F
-            trigger_begin = meta.begin_offset,
-            trigger_is_ack = meta.flags == uuid::Flags::ACK_TXN,
+            trigger_begin,
+            trigger_is_ack = trigger.flags == uuid::Flags::ACK_TXN,
             "triggering backfill of gapped producer's pending transaction",
         );
         self.metrics.backfills_started.increment(1);
-
-        // `live` reconstructs the pending span from the recovered state and is
-        // installed into `pending` at completion.
-        ParkedTrigger {
-            parked,
-            target: meta.producer,
-            live: begin_backfill(gap_begin, recovered_last_commit),
-        }
-    }
-
-    /// Open the historical read half of a triggered backfill parked by
-    /// `park_backfill` and install the single actor-owned `Backfill`: a bounded,
-    /// non-blocking read of `[F, trigger.begin)` held in `BackfillIo::Reading`.
-    pub(super) fn start_backfill(
-        &mut self,
-        read_key: u32,
-        parked: ParkedTrigger,
-    ) -> anyhow::Result<()> {
-        let read_id = read_key as usize;
-        let ParkedTrigger {
-            parked,
-            target,
-            live,
-        } = parked;
-
-        let gap_begin = live.offset; // F
-        let trigger_begin = parked.meta.begin_offset;
-
-        // The range is always non-empty: `F < M <= trigger_begin`. The main read
-        // starts at M and parks at the first document it reaches, so the trigger
-        // is at or after M, while a gapped span begin F is strictly below M.
-        assert!(
-            gap_begin < trigger_begin,
-            "backfill range [{gap_begin}, {trigger_begin}) must be non-empty: F precedes M, \
-             which is at-or-below the trigger",
-        );
 
         // Start the bounded, non-blocking historical read. Same client, auth,
         // begin_mod_time, schema validation, and partition-filtered journal as
         // the main read; no write-head probe is needed for a bounded range. The
         // read carries the plain `read_key` as its id: the historical read never
         // shares the heap or `pending_reads` with main reads.
-        let binding = &self.topology.bindings[self.reads[read_id].binding_index as usize];
         let client = (*self.topology.journal_clients[binding.index as usize]).clone();
         let request = backfill_read_request(
             &self.reads[read_id].journal,
@@ -341,9 +257,9 @@ impl SliceActor {
         );
         self.backfill = Some(Backfill {
             read_key,
-            parked,
             target,
-            live,
+            gap_begin,
+            trigger_begin,
             io: BackfillIo::Reading(read),
             started_at: std::time::Instant::now(),
             physical_bytes: 0,
@@ -356,18 +272,19 @@ impl SliceActor {
     /// recovered target-producer documents in journal order and skip others,
     /// until the batch is exhausted (its historical read returns to `Reading`,
     /// re-polled by the `select!` arm) or an Append channel lacks capacity (the
-    /// cursor parks at that document). Backfill documents never touch the main
-    /// read's offset baselines or `pending`/`settled` (spec §Read positions,
-    /// §Completion).
+    /// cursor parks at that document). Backfill documents advance the target's
+    /// ordinary `pending` state but never touch the main read's offset baselines
+    /// (spec §Read positions, §Completion).
     ///
     /// Called from `try_log_request_tx` after the flush-priority check and
     /// independent of the ready heap and its tailing gate (which the backfill
     /// blocks entirely). Returns `Some(tx)` when an Append channel lacked
     /// capacity — the caller wakes on `tx` and retries — or `None` otherwise.
     ///
-    /// Sequences from the same `live` snapshot on each attempt, advancing `live`
-    /// only after the append is sent, so a retry after a full channel doesn't
-    /// double-sequence. Takes ownership of the single `Backfill` for the duration
+    /// Sequences each document against the target's pending-else-settled snapshot
+    /// and commits back into `pending` only after the append is sent, so a retry
+    /// after a full channel re-sequences from the same snapshot and never
+    /// double-appends. Takes ownership of the single `Backfill` for the duration
     /// so `io` can be restructured while `reads`/`topology` and the Log channels
     /// are borrowed; it is put back before returning.
     pub(super) fn try_drain_backfill(
@@ -384,7 +301,7 @@ impl SliceActor {
             return Ok(None);
         }
 
-        let read_state = &self.reads[backfill.read_key as usize];
+        let read_state = &mut self.reads[backfill.read_key as usize];
         let binding = &self.topology.bindings[read_state.binding_index as usize];
 
         loop {
@@ -403,20 +320,44 @@ impl SliceActor {
                 continue;
             }
 
-            let sequenced = match sequence_backfill_document(
-                backfill.live.clone(),
-                &read_state.journal,
-                binding,
-                &meta,
-            ) {
-                Ok(sequenced) => sequenced,
-                Err(err) => {
-                    // Restore before fail-fast so teardown's `Drop` accounting
-                    // still counts this backfill and its parked read as stopped.
-                    self.backfill = Some(backfill);
-                    return Err(err);
-                }
-            };
+            // Sequence against the target's ordinary pending-else-settled state:
+            // the reconstructed open span installed at trigger time (or extended by
+            // prior backfill iterations). Pure/speculative; committed only after
+            // the append succeeds.
+            let producer_state = (read_state.pending.get(&meta.producer))
+                .or_else(|| read_state.settled.get(&meta.producer))
+                .cloned()
+                .unwrap_or_default();
+            let sequenced =
+                match state::sequence_producer(producer_state, &read_state.journal, binding, &meta)
+                {
+                    Ok(sequenced) => sequenced,
+                    Err(err) => {
+                        // Restore before fail-fast so teardown's `Drop` accounting
+                        // still counts this backfill as stopped.
+                        self.backfill = Some(backfill);
+                        return Err(err);
+                    }
+                };
+
+            // One-transaction invariant: `[F, trigger.begin)` reconstructs a single
+            // open span and holds no committing boundary (any state-changing ACK
+            // below M is reflected by checkpoint closure, and `[M, trigger.begin)`
+            // holds no target document — the main read parked at the first one). A
+            // commit here therefore contradicts the recovered checkpoint and is a
+            // terminal consistency error.
+            if sequenced.is_commit {
+                self.backfill = Some(backfill);
+                anyhow::bail!(
+                    "backfill of journal {} (binding {}) hit an unexpected committing document at \
+                     offset {} for target producer {:?}: a distinct transaction boundary inside the \
+                     historical range contradicts the recovered checkpoint",
+                    read_state.journal,
+                    binding.state_key(),
+                    meta.begin_offset,
+                    meta.producer,
+                );
+            }
 
             if sequenced.is_append {
                 let BackfillIo::Draining(cursor) = &backfill.io else {
@@ -431,15 +372,18 @@ impl SliceActor {
                     &self.log_request_tx,
                     cursor,
                 ) {
-                    // Park the cursor here; `live` is unchanged so the wake
+                    // Park the cursor here; `pending` is unchanged so the wake
                     // re-sequences this document from the same snapshot.
                     self.backfill = Some(backfill);
                     return Ok(Some(tx));
                 }
             }
 
-            // Commit `live` forward (never `pending`/`settled`) and advance.
-            backfill.live = sequenced.producer_state;
+            // Commit the reconstructed span forward into `pending` (never touching
+            // main-read offset baselines) and advance.
+            _ = read_state
+                .pending
+                .insert(meta.producer, sequenced.producer_state);
             backfill.io = advance_backfill_cursor(backfill.io);
         }
 
@@ -448,19 +392,20 @@ impl SliceActor {
     }
 
     /// Complete a backfill once its historical range has been fully read.
-    /// Completion commits nothing (spec §Completion): it installs the
-    /// reconstructed open span (`live`) into `pending`, removes the gap, and
-    /// re-presents the parked trigger to the ready heap with its head document
-    /// unconsumed. The drain loop re-pops it and sequences it through the
-    /// wholly-normal path — a CONTINUE extends the span and appends, an ACK
-    /// commits it (causal hints, committed offset, flush) — now that the
-    /// producer is no longer gapped.
-    fn complete_backfill(&mut self, backfill: Backfill) -> anyhow::Result<()> {
+    /// Completion commits and installs nothing (spec §Completion): the
+    /// reconstructed span was installed into `pending` at trigger time, so this
+    /// only reports the completion, increments `backfills_stopped`, and clears
+    /// `self.backfill` (by consuming it). The trigger remains at the head of the
+    /// ready heap; the next drain iteration pops it and sequences it against the
+    /// reconstructed span through the wholly-normal path — a CONTINUE extends the
+    /// span and appends, an ACK commits it (causal hints, committed offset, flush)
+    /// — now that the producer is no longer gapped.
+    fn complete_backfill(&mut self, backfill: Backfill) {
         let Backfill {
             read_key,
-            parked,
             target,
-            live,
+            gap_begin,
+            trigger_begin,
             io,
             started_at,
             physical_bytes,
@@ -472,38 +417,14 @@ impl SliceActor {
         );
         drop(io); // The exhausted historical read.
 
-        // Drop the gap now that its pending span is recovered. It was retained
-        // for the whole backfill so the release paths stay unchanged; `gap_begin`
-        // (F) is still needed for the range metric.
-        let gap_begin = self.reads[read_id]
-            .gaps
-            .remove(&target)
-            .expect("backfilling producer retains its gap");
-
-        // Computed before `live` is installed. An empty reconstructed span (no
-        // target-producer CONTINUEs found) is expected only when historical
-        // content was unavailable or filtered — a suspiciously short backfill —
-        // or, benignly, for a hint-only producer backfilled from F = 0.
-        let span_empty = live.max_continue == uuid::Clock::zero();
-
-        let binding = &self.topology.bindings[self.reads[read_id].binding_index as usize];
-        let read_delay = binding.read_delay;
-        let priority = binding.priority;
-
-        // `parked.meta` is the trigger; copy it out (`Meta` is Copy) for both the
-        // range metric and the re-presented heap entry's ordering keys.
-        let trigger = parked.meta;
-
-        // Install the reconstructed open span into `pending`. This is why there
-        // is no atomic visibility boundary to enforce: `live.offset` is the span
-        // begin `F`, identical to the durable checkpoint's record, so a flush
-        // carrying it changes nothing durably, and visibility stays gated by the
-        // absence of an ACK — exactly as for any normal mid-span producer. A
-        // crash before the eventual ACK flush recovers the unchanged positive
-        // `F`, re-creates the gap, and repeats idempotently. Completion arms no
-        // flush and touches neither `read_offset` nor causal hints: those all
-        // follow from the normal path when the trigger is re-sequenced below.
-        _ = self.reads[read_id].pending.insert(target, live);
+        // An empty reconstructed span (no target-producer CONTINUEs found) leaves
+        // the installed span at `max_continue == 0`. Expected only when historical
+        // content was unavailable or filtered — a suspiciously short backfill — or,
+        // benignly, for a hint-only producer backfilled from F = 0.
+        let span_empty = (self.reads[read_id].pending.get(&target))
+            .or_else(|| self.reads[read_id].settled.get(&target))
+            .map(|ps| ps.max_continue == uuid::Clock::zero())
+            .unwrap_or(true);
 
         let elapsed = started_at.elapsed();
         self.metrics.backfills_stopped.increment(1);
@@ -516,24 +437,15 @@ impl SliceActor {
             binding = self.reads[read_id].binding_index,
             journal = self.reads[read_id].journal.to_string(),
             producer = service_kit::event::debug(target),
-            range_bytes = trigger.begin_offset - gap_begin,
+            range_bytes = trigger_begin - gap_begin,
             physical_bytes,
             duration_ms = elapsed.as_millis() as u64,
             span_empty, // true flags a suspiciously short backfill (fragment loss)
             "completed backfill of gapped producer's transaction",
         );
 
-        // Re-present the parked trigger to the ready heap with its head document
-        // unconsumed. The clock-delay gate re-clears trivially (the trigger
-        // cleared it once already), and the drain loop sequences it through the
-        // normal path against the now-installed reconstructed span.
-        self.ready_read_heap.push(ReadyReadEntry {
-            priority,
-            adjusted_clock: trigger.clock + read_delay,
-            inner: Some(parked),
-        });
-
-        Ok(())
+        // `self.backfill` stays `None` (consumed). Draining resumes on the next
+        // iteration, which pops the trigger and sequences it normally.
     }
 
     /// Process the active backfill's historical read resolution, yielded by the
@@ -543,9 +455,9 @@ impl SliceActor {
     /// `BackfillIo::Draining` (drained by `try_drain_backfill`), and on stream
     /// end completes the backfill.
     ///
-    /// Takes ownership of the `Backfill` for the duration; puts it back unless
-    /// the stream ended (completion consumes it) or the journal was removed (a
-    /// benign stop that also unblocks the Slice).
+    /// Takes ownership of the `Backfill` for the duration; puts it back unless the
+    /// stream ended or the journal was removed (both complete the backfill and
+    /// consume it, also unblocking the Slice).
     pub(super) fn process_backfill_result(
         &mut self,
         result: Option<gazette::RetryResult<gazette::journal::read::LinesBatch>>,
@@ -561,9 +473,10 @@ impl SliceActor {
         let Some(result) = result else {
             // The bounded stream reached `end_offset`. Its final batch was fully
             // drained before we re-polled (so `io` is `Reading`), so every
-            // recovered Append precedes the final ACK flush on each Log channel.
-            // Complete the backfill (which consumes `backfill`).
-            return self.complete_backfill(backfill);
+            // recovered Append precedes the trigger's own append or commit on each
+            // Log channel. Complete the backfill (which consumes `backfill`).
+            self.complete_backfill(backfill);
+            return Ok(());
         };
 
         let lines_batch = match result {
@@ -572,32 +485,32 @@ impl SliceActor {
                 inner: err,
             }) => match read::classify_read_failure(err) {
                 read::ReadFailure::JournalRemoved(status) => {
-                    // Deletion or FULL suspension implies no fragments remain, so
-                    // the range can never be recovered. This stops the backfill
-                    // benignly, exactly as an EOF stops a main read — not a
-                    // failure — and, because the backfill blocked the Slice, also
-                    // unblocks it. Count it as completed (no longer in flight) and
-                    // drop the `Backfill`, which releases the parked main read and
-                    // (by dropping `io`) cancels the historical stream. The trigger
-                    // is NOT re-presented and no progress is committed. The read is
-                    // now discarded, so its `gaps` are left inert (as on a
-                    // main-read EOF); its slot is never reused.
+                    // Journal removal during a backfill is the degenerate case of
+                    // the accepted historical-fragment-loss risk: the entire unread
+                    // remainder `[here, trigger.begin)` is one big hole — "you get
+                    // what you get". Deletion or FULL suspension implies fragments
+                    // were already gone. Treat it as an implicit EOF: complete the
+                    // backfill with whatever span was reconstructed so far (possibly
+                    // empty), which also unblocks the Slice. The trigger then
+                    // sequences normally (an ACK commits the recovered extent,
+                    // possibly empty; a CONTINUE extends a span that simply never
+                    // commits), and the main read discovers the removal itself when
+                    // its `ReadLines` is re-polled after the buffered tail drains —
+                    // stopping through the ordinary main-read JournalRemoved arm with
+                    // correct accounting. No heap surgery of any kind is needed.
                     service_kit::event!(
                         tracing::Level::INFO,
                         "backfill",
+                        session = self.topology.session_id,
                         read_id,
                         binding = binding.index,
                         journal = self.reads[read_id].journal.to_string(),
                         producer = service_kit::event::debug(backfill.target),
-                        "backfill journal removed ({}); stopping backfill",
+                        "backfill journal removed ({}); completing as implicit EOF",
                         status.as_str_name(),
                     );
-                    // The dropped `Backfill` releases the parked main read too,
-                    // which would otherwise stop uncounted (its own removal is
-                    // never observed: it is parked, not polled).
-                    self.metrics.reads_stopped.increment(1);
-                    self.metrics.backfills_stopped.increment(1);
-                    return Ok(()); // `backfill` dropped here.
+                    self.complete_backfill(backfill);
+                    return Ok(());
                 }
                 read::ReadFailure::Transient(err) => {
                     service_kit::event!(
@@ -618,8 +531,7 @@ impl SliceActor {
                 read::ReadFailure::Terminal(err) => {
                     // Fail-fast: the whole session tears down. The teardown is
                     // the signal, so no dedicated event fires — but restore the
-                    // backfill so `Drop` accounting still counts it (and its
-                    // parked read) as stopped.
+                    // backfill so `Drop` accounting still counts it as stopped.
                     self.backfill = Some(backfill);
                     return Err(read::map_read_error(
                         err,
@@ -658,9 +570,9 @@ impl SliceActor {
             Ok(ready_read) => ready_read,
             Err(err) => {
                 // The historical read was consumed, so the `Backfill` cannot be
-                // restored for `Drop` accounting; count it and its parked read
-                // as stopped here, as a main read's terminal path does.
-                self.metrics.reads_stopped.increment(1);
+                // restored for `Drop` accounting; count it as stopped here. The
+                // triggering main read is counted separately at `Drop` via the
+                // ready heap, where its trigger still sits.
                 self.metrics.backfills_stopped.increment(1);
                 return Err(err);
             }
@@ -753,19 +665,6 @@ mod test {
     }
 
     #[test]
-    fn test_begin_backfill() {
-        // The open span is reconstructed from the recovered state: `live` starts
-        // at `{recovered last_commit, max_continue: 0, offset: F}`, and is
-        // installed into `pending` unchanged at completion.
-        let last_commit = Clock::from_u64(100);
-        let live = begin_backfill(300, last_commit);
-
-        assert_eq!(live.last_commit, last_commit);
-        assert_eq!(live.max_continue, Clock::zero());
-        assert_eq!(live.offset, 300, "live offset reconstructs the span from F");
-    }
-
-    #[test]
     fn test_backfill_read_request() {
         // The bounded historical read reads `[F, trigger_begin)` non-blocking,
         // with the main read's partition-filtered journal and `begin_mod_time`.
@@ -789,41 +688,48 @@ mod test {
     }
 
     #[test]
-    fn test_backfill_intermediate_commit_is_detected() {
-        // `sequence_backfill_document` sequences target-producer documents
-        // against the gap's `live` state and bails when `sequence_producer`
-        // reports a commit — a committing document inside the historical range
+    fn test_backfill_one_transaction_invariant() {
+        // `try_drain_backfill` sequences target-producer documents against the
+        // reconstructed span with `state::sequence_producer` and enforces the
+        // one-transaction invariant inline: it bails when the sequenced document
+        // commits, because a committing document inside `[F, trigger.begin)`
         // contradicts the recovered checkpoint's single open span (spec
-        // §One-transaction invariant).
+        // §One-transaction invariant). This exercises that commit/no-commit
+        // decision boundary the inline guard keys off.
         let binding = test_binding(0, true, None, "/suffix");
         let p = producer(0x01);
 
-        let live = ProducerState {
+        // The reconstructed span installed at trigger time: F = 200.
+        let span = ProducerState {
             last_commit: Clock::from_u64(100),
             max_continue: Clock::zero(),
             offset: 200,
+            gapped: false,
         };
-        // A CONTINUE extends the reconstructed span — not a commit.
-        let s = sequence_backfill_document(
-            live,
+
+        // A CONTINUE extends the reconstructed span — not a commit, so the drain
+        // does not bail and would append it.
+        let s = state::sequence_producer(
+            span,
             "test/journal",
             &binding,
             &meta(p, Clock::from_u64(150), CONTINUE, 200, 210),
         )
-        .expect("CONTINUE within the range is not a commit");
-        assert!(!s.is_commit);
+        .expect("sequencing a CONTINUE succeeds");
+        assert!(!s.is_commit, "a CONTINUE within the range never bails");
 
-        // A committing ACK within the range is a terminal consistency error.
-        let err = sequence_backfill_document(
+        // A committing ACK within the range sets is_commit — the inline guard in
+        // `try_drain_backfill` bails on exactly this.
+        let s = state::sequence_producer(
             s.producer_state,
             "test/journal",
             &binding,
             &meta(p, Clock::from_u64(150), ACK, 210, 220),
         )
-        .expect_err("a committing ACK inside the range is detected and bails");
+        .expect("sequencing an ACK succeeds");
         assert!(
-            err.to_string().contains("unexpected committing document"),
-            "unexpected error: {err}",
+            s.is_commit,
+            "a committing ACK inside the range trips the one-transaction guard",
         );
     }
 }

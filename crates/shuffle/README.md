@@ -132,14 +132,15 @@ from a checkpoint-derived position: on restart each `(binding, journal)` read
 begins at the furthest position its checkpoint justifies (`M`). Uncommitted
 producer spans beginning before `M` are remembered as *gapped* and skipped, so a
 dead producer's stale open span costs no repeated whole-journal catch-up. If a
-gapped producer later emits any newer document, the read parks at it, backfills
-only the skipped `[F, trigger)` range from cold storage if needed, then
-re-presents the parked document to the normal read path — which extends the
-reconstructed span or commits it, exactly as for any live open span. The
-essential difference: such gapped reads are a one-time startup behavior, not a
-regular occurrence. Shuffle log segments retain all uncommitted documents
-observed reading from after `M`. See the "Gapped-producer recovery" section
-below.
+gapped producer later emits any newer document, the read parks at that *trigger*
+(leaving it buffered at the head of its read), reconstructs the recovered open
+span, and backfills only the skipped `[F, trigger)` range from cold storage if
+needed; when the backfill completes, the trigger sequences through the normal
+read path — extending the reconstructed span or committing it, exactly as for any
+live open span. The essential difference: such gapped reads are a one-time
+startup behavior, not a regular occurrence. Shuffle log segments retain all
+uncommitted documents observed reading from after `M`. See the "Gapped-producer
+recovery" section below.
 
 **Per-shard RPCs → shared streams**: The legacy system starts an RPC per
 (shard, journal) pair, which doesn't scale: at M=10 shards with N=100k
@@ -266,47 +267,58 @@ The top document is sequenced against per-producer state using
 
 A producer whose uncommitted span begins before the resolved start offset `M`
 is *gapped* (`slice/gap.rs`): its recovered `ProducerState` is frozen in
-`settled` and `ReadState::gaps` pins the span begin `F` (a plain `producer -> F`
-map). The main read's documents for a gapped producer are classified by
-`sequence_gapped` rather than `uuid::sequence` — whose frozen `max_continue == 0`
-would misreport them — into: drop (a duplicate), a durable clean/deep rollback
-(an ACK at or below `last_commit` clears the gap with a committed `-ack_end`, no
-historical I/O), a newer OUTSIDE that clears the gap, or a backfill *trigger* —
-the first newer document, CONTINUE or ACK.
+`settled` with its in-memory `gapped` bit set, and while set its `offset` is the
+pinned span begin `F`. (The bit cannot be fully derived from
+`{last_commit, max_continue, offset}` — an empty backfill leaves `{last_commit, 0, F}`,
+indistinguishable from a still-gapped entry — so it is stored explicitly; it is
+in-memory only, and `resolve_checkpoint` re-derives it on restart.) The main
+read's documents for a gapped producer are classified by `sequence_gapped` rather
+than `uuid::sequence` — whose frozen `max_continue == 0` would misreport them —
+into: drop (a duplicate), a durable clean/deep rollback (an ACK at or below
+`last_commit` clears the bit with a committed `-ack_end`, no historical I/O), a
+newer OUTSIDE that clears the bit, or a backfill *trigger* — the first newer
+document, CONTINUE or ACK.
 
-On a trigger the main read *parks* at that document: all live recovery state is
-consolidated in the single actor-owned `Backfill` (`SliceActor::backfill`)
-holding the shelved `ReadyRead` (whose head IS the trigger), the target
-producer, the reconstructed `live` sequencing state, and the historical read's
-I/O state (`BackfillIo`: either `Reading` the next batch or `Draining` a
-resolved one). The bounded historical read of `[F, trigger.begin)` is polled by
-a dedicated `select!` arm while `Reading` (with the plain read id — it never
-shares the heap or `pending_reads` with main reads). Each resolved batch becomes
-a `Draining` cursor, drained by `try_drain_backfill` directly in
-`try_log_request_tx`: target-producer documents are sequenced against `live` and
-appended through the normal path (others are skipped), and the inner read is
-re-polled only once the batch is fully drained.
+On a trigger the main read *parks*, but the trigger is **not** popped or shelved:
+it stays buffered at the head of its read in the ready heap. At trigger time the
+actor reconstructs the recovered open span directly into the read's ordinary
+`pending` map as `{last_commit, max_continue: 0, offset: F, gapped: false}` —
+which both installs the span and clears the gapped marker — and opens a bounded
+historical read of `[F, trigger.begin)` held in the single actor-owned `Backfill`
+(`SliceActor::backfill`: the historical read's I/O state, `BackfillIo` — either
+`Reading` the next batch or `Draining` a resolved one — plus the bookkeeping to
+report completion). The historical read is polled by a dedicated `select!` arm
+while `Reading` (with the plain read id — it never shares the heap or
+`pending_reads` with main reads). Each resolved batch becomes a `Draining` cursor,
+drained by `try_drain_backfill` directly in `try_log_request_tx`: target-producer
+documents are sequenced against the ordinary pending-else-settled state
+(committed back into `pending` only after the append is sent, so a retry after a
+full channel re-sequences from the same snapshot) and appended through the normal
+path (others are skipped), and the inner read is re-polled only once the batch is
+fully drained. There is no separate `live` state — the span advances the ordinary
+`pending` state while the heap holds still.
 
-Completion commits nothing: when the stream reaches `trigger.begin`, `live` (the
-reconstructed open span) is installed into `pending`, the gap is removed, and the
-parked trigger is re-presented to the ready heap with its head unconsumed. The
-drain loop re-pops it and sequences it through the wholly-normal path — a
-CONTINUE extends the span and appends, an ACK commits it (causal hints, offset,
-flush). Installing `live` is safe because its `offset` stays at the span begin
-`F`, which the durable checkpoint already records, so a flush carrying it changes
-nothing durably; an open uncommitted span is a state every mechanism already
-handles, and visibility stays gated by the absence of an ACK. There is thus no
-atomic visibility boundary to enforce — atomicity is inherited from normal
-ACK-gated visibility — and a crash before the eventual ACK flush recovers `F`,
-re-creates the gap, and repeats idempotently.
+Completion commits and installs nothing — the span was installed at trigger time.
+When the stream reaches `trigger.begin`, the backfill is simply cleared and its
+completion is reported (range/physical bytes, duration, `span_empty`). The next
+drain iteration pops the trigger — now that the producer is no longer gapped and
+its `pending` state is the reconstructed span — and sequences it through the
+wholly-normal path: a CONTINUE extends the span and appends, an ACK commits it
+(causal hints, offset, flush). This is durably safe because `max_continue` is not
+persisted and the span's `offset` stays at `F`, which the durable checkpoint
+already records, so a flush carrying it changes nothing durably; visibility stays
+gated by the absence of an ACK. There is thus no atomic visibility boundary to
+enforce — atomicity is inherited from normal ACK-gated visibility — and a crash
+before the eventual ACK flush recovers `F`, re-creates the gap, and repeats
+idempotently.
 
 Backfilled documents do **not** flow through the ready heap. The trigger only
 reached this code by clearing the drain loop's clock-delay gate; with the same
 binding read-delay and strictly-ascending per-producer clocks, every historical
 document's adjusted clock is already in the past, so heap ordering, priority
 ordering, and clock gating are provable no-ops for them. The cursor drain runs
-after the flush-priority check (so all backfill appends precede the re-presented
-trigger's own append or commit).
+after the flush-priority check (so all backfill appends precede the trigger's own
+eventual append or commit).
 
 **A backfill blocks all main-read → Log I/O for the whole Slice until it
 completes.** After the flush-priority check and cursor drain, `try_log_request_tx`
@@ -321,14 +333,18 @@ and blocked all draining anyway. Because triggers are discovered only by
 sequencing the heap top and the heap does not drain during a backfill, **at most
 one backfill exists per Slice, globally** — a structural invariant. Other
 journals' reads still *resolve* into the heap during the backfill; they simply
-don't drain until it completes and the parked trigger is re-presented, after
-which normal (priority, adjusted-clock) draining resumes.
+don't drain until it completes, after which normal (priority, adjusted-clock)
+draining resumes and the trigger is re-sequenced.
 
 Gap state is never persisted; recovery is derived entirely from the durable
-producer checkpoint. When a read stops or the session ends its `gaps` are left
-inert (the read is never re-served); only an active backfill is torn down,
-releasing its parked main read and in-flight historical read. A benign journal
-removal during a backfill likewise drops it, which also unblocks the Slice.
+producer checkpoint. When a read stops or the session ends its in-memory gapped
+bits are left inert (the read is never re-served); only an active backfill is
+torn down, releasing its in-flight historical read (the triggering main read is
+in the heap and stops through its own path). A journal removed *during* a backfill
+is treated as an implicit EOF: the backfill completes with whatever span was
+reconstructed so far (also unblocking the Slice), the trigger then commits the
+recovered extent (possibly empty), and the main read discovers the removal itself
+when re-polled — stopping through its ordinary path.
 
 ### 7. Key Extraction and Append Routing
 

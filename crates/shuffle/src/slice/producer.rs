@@ -26,6 +26,21 @@ pub struct ProducerState {
     pub max_continue: Clock,
     /// Journal byte offset, sign-encoded (see struct docs).
     pub offset: i64,
+    /// Whether this producer is *gapped*: its uncommitted span begins at `offset`
+    /// (`F`) below the restart position `M`, so the main read skipped `[F, M)` and
+    /// the entry is frozen until it resolves (see `plans/shuffle-gapped-restart.md`
+    /// §Gapped state). Freeze invariant: while set, `offset` is the pinned `F` and
+    /// only the four resolutions — backfill trigger, clean rollback, deep rollback,
+    /// and a newer OUTSIDE commit — clear it.
+    ///
+    /// In-memory only: `ProducerFrontier` has no corresponding field, so the bit
+    /// cannot leak durably and recovery re-derives it in `resolve_checkpoint`. It
+    /// is NOT fully derivable from `{last_commit, max_continue, offset}`: an empty
+    /// backfill completion (`span_empty`) leaves `{last_commit, 0, F}`,
+    /// indistinguishable from a still-gapped entry. The bit records "already
+    /// reconstructed, awaiting the trigger's re-sequencing", preventing an infinite
+    /// re-trigger loop.
+    pub gapped: bool,
 }
 
 impl Default for ProducerState {
@@ -34,10 +49,11 @@ impl Default for ProducerState {
             last_commit: Clock::zero(),
             max_continue: Clock::zero(),
             offset: 0,
+            gapped: false,
         }
     }
 }
-const _: () = assert!(std::mem::size_of::<ProducerState>() == 24);
+const _: () = assert!(std::mem::size_of::<ProducerState>() == 32);
 
 /// Build a [`crate::Frontier`] by reducing read-derived producer state with
 /// causal hints.
@@ -180,6 +196,7 @@ mod test {
                     last_commit: Clock::from_u64(last_commit),
                     max_continue: Clock::zero(),
                     offset,
+                    gapped: false,
                 },
             );
         }
@@ -188,7 +205,6 @@ mod test {
             journal: journal.into(),
             settled: ProducerMap::default(),
             pending: map,
-            gaps: Default::default(),
             read_offset,
             prev_read_offset,
             write_head,
