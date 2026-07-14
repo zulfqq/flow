@@ -735,15 +735,18 @@ impl SliceActor {
             else {
                 return Ok(idle);
             };
-            let adjusted_clock = *adjusted_clock;
             let ready_read = ready_read.as_deref().unwrap();
-            let read_id = ready_read.inner.id() as usize;
-            let meta = ready_read.meta; // `Meta` is Copy.
+
+            let ReadyRead {
+                meta, inner: read, ..
+            } = ready_read;
+
+            let read_id = read.id() as usize;
+            let read_state = &mut self.reads[read_id];
+            let binding = &self.topology.bindings[read_state.binding_index as usize];
 
             // Gate on the adjusted clock: sleep until wall-clock time catches up.
-            // This is how read delays impose cross-transform ordering. Only main
-            // reads reach here; backfill documents are drained above.
-            if let Some(wait) = state::clock_delay(&adjusted_clock, now, crate::now_clock) {
+            if let Some(wait) = state::clock_delay(adjusted_clock, now, crate::now_clock) {
                 return Ok(future::Either::Right(future::Either::Left(
                     tokio::time::sleep(wait).map(|()| true),
                 )));
@@ -758,19 +761,11 @@ impl SliceActor {
             // document is irrevocably consumed below. Sequencing stays AFTER the
             // clock-delay gate: a backfill's direct historical appends are sound
             // only because the trigger cleared that gate first.
-            let binding = &self.topology.bindings[self.reads[read_id].binding_index as usize];
-            let producer_state = (self.reads[read_id].pending.get(&meta.producer))
-                .or_else(|| self.reads[read_id].settled.get(&meta.producer))
-                .cloned() // This is a cheap clone.
-                .unwrap_or_default();
+            let producer_state = read_state.producer_state(meta.producer);
 
             let (sequenced, gapped) = if !producer_state.gapped {
-                let doc = state::sequence_producer(
-                    producer_state,
-                    &self.reads[read_id].journal,
-                    binding,
-                    &meta,
-                )?;
+                let doc =
+                    state::sequence_producer(producer_state, &read_state.journal, binding, &meta)?;
                 (doc, None)
             } else {
                 let outcome = state::sequence_gapped(producer_state.last_commit, &meta);
@@ -788,7 +783,7 @@ impl SliceActor {
                         // frozen entry's `offset` (freeze invariant).
                         self.start_backfill(
                             read_id as u32,
-                            &meta,
+                            *meta, // Meta is Copy.
                             producer_state.offset,
                             producer_state.last_commit,
                         )?;
@@ -828,7 +823,7 @@ impl SliceActor {
                     state::GappedOutcome::OutsideResolve => {
                         let mut doc = state::sequence_producer(
                             producer_state,
-                            &self.reads[read_id].journal,
+                            &read_state.journal,
                             binding,
                             &meta,
                         )?;
@@ -838,16 +833,6 @@ impl SliceActor {
                 };
                 (doc, Some(outcome))
             };
-
-            let read_state = &mut self.reads[read_id];
-            let binding = &self.topology.bindings[read_state.binding_index as usize];
-            let ready_read = self
-                .ready_read_heap
-                .peek()
-                .unwrap()
-                .inner
-                .as_deref()
-                .unwrap();
 
             // If this is an Append, attempt to send it to the appropriate shard(s).
             if sequenced.is_append {

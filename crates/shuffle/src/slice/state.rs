@@ -699,10 +699,7 @@ mod test {
         binding: &crate::Binding,
         meta: &Meta,
     ) -> anyhow::Result<SequencedDoc> {
-        let producer_state = (read_state.pending.get(&meta.producer))
-            .or_else(|| read_state.settled.get(&meta.producer))
-            .cloned()
-            .unwrap_or_default();
+        let producer_state = read_state.producer_state(meta.producer);
         sequence_producer(producer_state, &read_state.journal, binding, meta)
     }
 

@@ -174,7 +174,7 @@ impl SliceActor {
     pub(super) fn start_backfill(
         &mut self,
         read_key: u32,
-        trigger: &Meta,
+        trigger: Meta,
         gap_begin: i64,
         recovered_last_commit: uuid::Clock,
     ) -> anyhow::Result<()> {
@@ -324,10 +324,7 @@ impl SliceActor {
             // the reconstructed open span installed at trigger time (or extended by
             // prior backfill iterations). Pure/speculative; committed only after
             // the append succeeds.
-            let producer_state = (read_state.pending.get(&meta.producer))
-                .or_else(|| read_state.settled.get(&meta.producer))
-                .cloned()
-                .unwrap_or_default();
+            let producer_state = read_state.producer_state(meta.producer);
             let sequenced =
                 match state::sequence_producer(producer_state, &read_state.journal, binding, &meta)
                 {
@@ -421,10 +418,8 @@ impl SliceActor {
         // the installed span at `max_continue == 0`. Expected only when historical
         // content was unavailable or filtered — a suspiciously short backfill — or,
         // benignly, for a hint-only producer backfilled from F = 0.
-        let span_empty = (self.reads[read_id].pending.get(&target))
-            .or_else(|| self.reads[read_id].settled.get(&target))
-            .map(|ps| ps.max_continue == uuid::Clock::zero())
-            .unwrap_or(true);
+        let span_empty =
+            self.reads[read_id].producer_state(target).max_continue == uuid::Clock::zero();
 
         let elapsed = started_at.elapsed();
         self.metrics.backfills_stopped.increment(1);

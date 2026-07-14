@@ -68,6 +68,17 @@ impl ReadState {
         self.write_head = offset;
         self.prev_write_head = offset;
     }
+
+    /// The producer's latest state as a cheap clone: `pending` (updated since the
+    /// last flush) takes precedence over `settled`, and an unknown producer
+    /// defaults. This is the single pending-else-settled lookup the drain and
+    /// backfill paths perform per document before sequencing.
+    pub fn producer_state(&self, producer: uuid::Producer) -> ProducerState {
+        (self.pending.get(&producer))
+            .or_else(|| self.settled.get(&producer))
+            .cloned()
+            .unwrap_or_default()
+    }
 }
 
 /// Metadata about a document in a ReadyRead batch.
