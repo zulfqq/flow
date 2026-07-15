@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "select\n            dp.data_plane_name,\n            dp.cidr_blocks::text[] as \"cidr_blocks!: Vec<String>\",\n            dp.gcp_service_account_email,\n            dp.aws_iam_user_arn,\n            dp.azure_application_name,\n            dp.azure_application_client_id,\n            dp.private_links as \"private_links!: Vec<serde_json::Value>\",\n            dp.aws_link_endpoints as \"aws_link_endpoints: Vec<serde_json::Value>\",\n            dp.azure_link_endpoints as \"azure_link_endpoints: Vec<serde_json::Value>\",\n            dp.gcp_psc_endpoints as \"gcp_psc_endpoints: Vec<serde_json::Value>\"\n        from unnest($1::text[]) as input(name)\n        join data_planes dp on dp.data_plane_name = input.name\n        ",
+  "query": "select\n            dp.data_plane_name,\n            dp.enabled,\n            dp.cidr_blocks::text[] as \"cidr_blocks!: Vec<String>\",\n            dp.gcp_service_account_email,\n            dp.aws_iam_user_arn,\n            dp.azure_application_name,\n            dp.azure_application_client_id,\n            dp.private_links as \"private_links!: Vec<serde_json::Value>\",\n            dp.aws_link_endpoints as \"aws_link_endpoints: Vec<serde_json::Value>\",\n            dp.azure_link_endpoints as \"azure_link_endpoints: Vec<serde_json::Value>\",\n            dp.gcp_psc_endpoints as \"gcp_psc_endpoints: Vec<serde_json::Value>\"\n        from unnest($1::text[]) as input(name)\n        join data_planes dp on dp.data_plane_name = input.name\n        ",
   "describe": {
     "columns": [
       {
@@ -10,46 +10,51 @@
       },
       {
         "ordinal": 1,
+        "name": "enabled",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 2,
         "name": "cidr_blocks!: Vec<String>",
         "type_info": "TextArray"
       },
       {
-        "ordinal": 2,
+        "ordinal": 3,
         "name": "gcp_service_account_email",
         "type_info": "Text"
       },
       {
-        "ordinal": 3,
+        "ordinal": 4,
         "name": "aws_iam_user_arn",
         "type_info": "Text"
       },
       {
-        "ordinal": 4,
+        "ordinal": 5,
         "name": "azure_application_name",
         "type_info": "Text"
       },
       {
-        "ordinal": 5,
+        "ordinal": 6,
         "name": "azure_application_client_id",
         "type_info": "Text"
       },
       {
-        "ordinal": 6,
+        "ordinal": 7,
         "name": "private_links!: Vec<serde_json::Value>",
         "type_info": "JsonArray"
       },
       {
-        "ordinal": 7,
+        "ordinal": 8,
         "name": "aws_link_endpoints: Vec<serde_json::Value>",
         "type_info": "JsonArray"
       },
       {
-        "ordinal": 8,
+        "ordinal": 9,
         "name": "azure_link_endpoints: Vec<serde_json::Value>",
         "type_info": "JsonArray"
       },
       {
-        "ordinal": 9,
+        "ordinal": 10,
         "name": "gcp_psc_endpoints: Vec<serde_json::Value>",
         "type_info": "JsonArray"
       }
@@ -60,6 +65,7 @@
       ]
     },
     "nullable": [
+      false,
       false,
       null,
       true,
@@ -72,5 +78,5 @@
       true
     ]
   },
-  "hash": "a93ae7bf9e1f6b70def0680845e783a097cab9a98b20f17a5f125f993c295062"
+  "hash": "a612147fb1577b38f39b60aa670f6d3b384098ba787765dd0bdad823d71e3b77"
 }

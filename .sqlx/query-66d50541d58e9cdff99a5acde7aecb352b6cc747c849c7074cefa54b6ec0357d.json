@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "select data_plane_name as \"data_plane_name!: String\"\n                   from data_planes\n                   where enabled = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "data_plane_name!: String",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Bool"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "66d50541d58e9cdff99a5acde7aecb352b6cc747c849c7074cefa54b6ec0357d"
+}

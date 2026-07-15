@@ -711,6 +711,10 @@ type DataPlane {
 	"""
 	isPublic: Boolean!
 	"""
+	Whether this data plane is enabled and available for use.
+	"""
+	enabled: Boolean!
+	"""
 	CIDR blocks for this data-plane.
 	"""
 	cidrBlocks: [String!]!
@@ -789,6 +793,17 @@ type DataPlaneEdge {
 	A cursor for use in pagination
 	"""
 	cursor: String!
+}
+
+"""
+Optional filter for the `dataPlanes` query. When omitted, all accessible
+data planes are returned.
+"""
+input DataPlanesFilter {
+	"""
+	Filter on the `enabled` flag.
+	"""
+	enabled: BoolFilter
 }
 
 input DateFilter {
@@ -1627,8 +1642,11 @@ type QueryRoot {
 	
 	Results are paginated and sorted by data_plane_name.
 	Only data planes the user has at least read capability to are returned.
+	
+	`filter.enabled.eq` restricts results to data planes whose `enabled`
+	flag matches it; omitting it returns both enabled and disabled planes.
 	"""
-	dataPlanes(after: String, before: String, first: Int, last: Int): DataPlaneConnection!
+	dataPlanes(filter: DataPlanesFilter, after: String, before: String, first: Int, last: Int): DataPlaneConnection!
 	"""
 	Returns all public data planes.
 	

@@ -1,3 +1,4 @@
+use super::filters;
 use async_graphql::{
     ComplexObject, Context, SimpleObject,
     types::connection::{self, Connection},
@@ -5,6 +6,14 @@ use async_graphql::{
 use std::collections::HashMap;
 
 const DEFAULT_PAGE_SIZE: usize = 50;
+
+/// Optional filter for the `dataPlanes` query. When omitted, all accessible
+/// data planes are returned.
+#[derive(Debug, Clone, Default, async_graphql::InputObject)]
+pub struct DataPlanesFilter {
+    /// Filter on the `enabled` flag.
+    pub enabled: Option<filters::BoolFilter>,
+}
 
 /// Cloud provider where the data plane is hosted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, async_graphql::Enum)]
@@ -36,6 +45,8 @@ pub struct DataPlane {
     pub tag: String,
     /// Whether this is a public data-plane.
     pub is_public: bool,
+    /// Whether this data plane is enabled and available for use.
+    pub enabled: bool,
     /// CIDR blocks for this data-plane.
     pub cidr_blocks: Vec<String>,
     /// GCP service account email for this data-plane.
@@ -171,6 +182,7 @@ async fn fetch_data_plane_details(
     let rows = sqlx::query!(
         r#"select
             dp.data_plane_name,
+            dp.enabled,
             dp.cidr_blocks::text[] as "cidr_blocks!: Vec<String>",
             dp.gcp_service_account_email,
             dp.aws_iam_user_arn,
@@ -194,6 +206,7 @@ async fn fetch_data_plane_details(
             (
                 row.data_plane_name,
                 DataPlaneDetails {
+                    enabled: row.enabled,
                     cidr_blocks: row.cidr_blocks,
                     gcp_service_account_email: row.gcp_service_account_email,
                     aws_iam_user_arn: row.aws_iam_user_arn,
@@ -210,6 +223,7 @@ async fn fetch_data_plane_details(
 }
 
 struct DataPlaneDetails {
+    enabled: bool,
     cidr_blocks: Vec<String>,
     gcp_service_account_email: Option<String>,
     aws_iam_user_arn: Option<String>,
@@ -363,9 +377,13 @@ impl DataPlanesQuery {
     ///
     /// Results are paginated and sorted by data_plane_name.
     /// Only data planes the user has at least read capability to are returned.
+    ///
+    /// `filter.enabled.eq` restricts results to data planes whose `enabled`
+    /// flag matches it; omitting it returns both enabled and disabled planes.
     pub async fn data_planes(
         &self,
         ctx: &Context<'_>,
+        filter: Option<DataPlanesFilter>,
         after: Option<String>,
         before: Option<String>,
         first: Option<i32>,
@@ -374,6 +392,11 @@ impl DataPlanesQuery {
         let env = ctx.data::<crate::Envelope>()?;
         let claims = env.claims()?;
         let snapshot = env.snapshot();
+
+        let enabled_eq = filter
+            .as_ref()
+            .and_then(|f| f.enabled.as_ref())
+            .and_then(|f| f.eq);
 
         // Filter to only data planes the user can read and that have valid
         // names, sorted by data_plane_name for consistent pagination.
@@ -395,6 +418,23 @@ impl DataPlanesQuery {
             })
             .collect();
         accessible_data_planes.sort_by(|a, b| a.data_plane_name.cmp(&b.data_plane_name));
+
+        // The `enabled` flag lives in the database rather than the authz
+        // snapshot, so resolve the matching name set and apply the filter
+        // before pagination to keep page sizes and cursors correct.
+        if let Some(want_enabled) = enabled_eq {
+            let matching: std::collections::HashSet<String> = sqlx::query_scalar!(
+                r#"select data_plane_name as "data_plane_name!: String"
+                   from data_planes
+                   where enabled = $1"#,
+                want_enabled,
+            )
+            .fetch_all(&env.pg_pool)
+            .await?
+            .into_iter()
+            .collect();
+            accessible_data_planes.retain(|dp| matching.contains(&dp.data_plane_name));
+        }
 
         // Apply cursor-based pagination.
         let (rows, has_prev, has_next) =
@@ -446,6 +486,9 @@ impl DataPlanesQuery {
                     region,
                     tag,
                     is_public,
+                    // Defaults to enabled when detail rows are unexpectedly
+                    // absent, matching the column's own default.
+                    enabled: details.map(|d| d.enabled).unwrap_or(true),
                     cidr_blocks: details.map(|d| d.cidr_blocks.clone()).unwrap_or_default(),
                     gcp_service_account_email: details
                         .and_then(|d| d.gcp_service_account_email.clone()),
@@ -759,6 +802,89 @@ mod tests {
             first_error_message(&denied)
                 .contains("the request is missing a required Authorization: Bearer token"),
             "expected an unauthenticated error, got: {denied}",
+        );
+    }
+
+    // The `filter.enabled.eq` argument narrows the listing to matching planes,
+    // while omitting the filter returns both enabled and disabled planes. The
+    // `data_planes` fixture leaves both public planes enabled by default;
+    // disabling one exercises all three cases.
+    #[sqlx::test(
+        migrations = "../../supabase/migrations",
+        fixtures(path = "../../../fixtures", scripts("data_planes", "alice"))
+    )]
+    async fn test_graphql_data_planes_enabled_filter(pool: sqlx::PgPool) {
+        let _guard = test_server::init();
+
+        let disabled = "ops/dp/public/gcp-us-central1-c2";
+        let enabled = "ops/dp/public/aws-us-west-2-c1";
+        sqlx::query("UPDATE data_planes SET enabled = false WHERE data_plane_name = $1")
+            .bind(disabled)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let server =
+            test_server::TestServer::start(pool.clone(), test_server::snapshot(pool, false).await)
+                .await;
+        let token = server.make_access_token(uuid::Uuid::from_bytes([0x11; 16]), None);
+
+        // Collects the sorted set of returned data-plane names for the given
+        // `filter` argument (JSON null when omitted).
+        async fn names(
+            server: &test_server::TestServer,
+            token: &str,
+            filter: serde_json::Value,
+        ) -> Vec<String> {
+            let response: serde_json::Value = server
+                .graphql(
+                    &serde_json::json!({
+                        "query": r#"
+                        query($filter: DataPlanesFilter) {
+                            dataPlanes(filter: $filter) {
+                                edges { node { name enabled } }
+                            }
+                        }
+                        "#,
+                        "variables": { "filter": filter },
+                    }),
+                    Some(token),
+                )
+                .await;
+            let mut names: Vec<String> = response["data"]["dataPlanes"]["edges"]
+                .as_array()
+                .unwrap_or_else(|| panic!("expected edges, got: {response}"))
+                .iter()
+                .map(|e| e["node"]["name"].as_str().unwrap().to_string())
+                .collect();
+            names.sort();
+            names
+        }
+
+        // No filter: both planes, regardless of `enabled`.
+        assert_eq!(
+            names(&server, &token, serde_json::Value::Null).await,
+            vec![enabled.to_string(), disabled.to_string()],
+        );
+        // enabled eq true -> only the enabled plane.
+        assert_eq!(
+            names(
+                &server,
+                &token,
+                serde_json::json!({ "enabled": { "eq": true } })
+            )
+            .await,
+            vec![enabled.to_string()],
+        );
+        // enabled eq false -> only the disabled plane.
+        assert_eq!(
+            names(
+                &server,
+                &token,
+                serde_json::json!({ "enabled": { "eq": false } })
+            )
+            .await,
+            vec![disabled.to_string()],
         );
     }
 
