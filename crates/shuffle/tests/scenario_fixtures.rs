@@ -358,6 +358,16 @@ async fn shuffle_scenarios() {
         log_dir.path(),
     )
     .await;
+    data_plane.reset().await.expect("reset");
+
+    gapped_outside_violation(
+        &materialization_spec,
+        &capture_spec,
+        &data_plane.journal_client,
+        &service,
+        log_dir.path(),
+    )
+    .await;
 
     server_handle.abort();
     data_plane
@@ -1441,7 +1451,10 @@ async fn gapped_backfill(
     // P1 commits an OUTSIDE document, advancing M past F. The resume read
     // then starts at M rather than P2's span begin — the acceptance
     // criterion — and P2 (F = 0 < M) is gapped. F = 0 additionally
-    // exercises the deliberately-conservative offset==0 classification.
+    // exercises the span-at-head marker: the flushed checkpoint persists P2's
+    // entry as `{last_commit: raw 1, offset: 0}` so recovery can distinguish
+    // this real span from a hint-only placeholder, and it must still be
+    // gapped on resume.
     pub1.enqueue(
         |uuid| {
             Ok((
@@ -1811,4 +1824,130 @@ async fn gapped_backfill_blocks_other_journal(
     insta::assert_debug_snapshot!("gapped_backfill_blocks_other_journal_resumed", read2);
 
     resumed.close().await.expect("close resumed");
+}
+
+/// A gapped producer's newer OUTSIDE is a backfill trigger, and re-sequencing
+/// it against a *non-empty* reconstructed span is an evidenced protocol
+/// violation: readable journal content shows an open span followed by an
+/// OUTSIDE with no intervening rollback ACK. The session must fail-fast with
+/// `OutsideWithPrecedingContinue` — exactly what a legacy conservative re-read
+/// of the same content would derive (spec §Main-read outcomes while gapped).
+///
+/// P2 opens a CONTINUE span at F = 0; P1 commits an OUTSIDE advancing M past F;
+/// session 1 captures the checkpoint. P2 then violates the producer protocol by
+/// writing a newer OUTSIDE without first rolling back its open span. On resume
+/// P2 is gapped, the main read reaches P2's OUTSIDE (its first newer document)
+/// and triggers a backfill of `[0, outside.begin)`, which recovers P2's
+/// CONTINUE — a non-empty reconstruction — so the re-sequenced OUTSIDE fails
+/// and the session tears down with the sequencing error.
+async fn gapped_outside_violation(
+    materialization_spec: &flow::MaterializationSpec,
+    capture_spec: &flow::CaptureSpec,
+    journal_client: &gazette::journal::Client,
+    service: &shuffle::Service,
+    log_dir: &std::path::Path,
+) {
+    let phase1_dir = log_dir.join("gapped_outside_violation_p1");
+    let resume_dir = log_dir.join("gapped_outside_violation_resume");
+    std::fs::create_dir_all(&phase1_dir).unwrap();
+    std::fs::create_dir_all(&resume_dir).unwrap();
+
+    let p1 = uuid::Producer::from_bytes([0x01, 0x00, 0x00, 0x00, 0x00, 0x01]);
+    let p2 = uuid::Producer::from_bytes([0x03, 0x00, 0x00, 0x00, 0x00, 0x02]);
+    let mut pub1 = make_publisher(capture_spec, journal_client, p1);
+    let mut pub2 = make_publisher(capture_spec, journal_client, p2);
+
+    // P2 opens an uncommitted CONTINUE span (begin F = 0).
+    pub2.enqueue(
+        |uuid| {
+            Ok((
+                0,
+                serde_json::json!({
+                    "_meta": {"uuid": uuid.to_string()},
+                    "id": "gv-p2",
+                    "category": "alpha",
+                    "value": 20,
+                }),
+            ))
+        },
+        uuid::Flags::CONTINUE_TXN,
+    )
+    .await
+    .unwrap();
+    pub2.flush().await.unwrap();
+
+    // P1 commits an OUTSIDE document, advancing M past F. P2 is gapped on resume.
+    pub1.enqueue(
+        |uuid| {
+            Ok((
+                0,
+                serde_json::json!({
+                    "_meta": {"uuid": uuid.to_string()},
+                    "id": "gv-p1",
+                    "category": "alpha",
+                    "value": 10,
+                }),
+            ))
+        },
+        uuid::Flags::OUTSIDE_TXN,
+    )
+    .await
+    .unwrap();
+    pub1.flush().await.unwrap();
+
+    // Session 1: capture a checkpoint with P1 committed and P2 pending at F = 0.
+    let mut session = shuffle::SessionClient::open(
+        service,
+        build_task(materialization_spec),
+        build_shards(1, service.peer_endpoint(), &phase1_dir),
+        Default::default(),
+    )
+    .await
+    .expect("SessionClient::open phase 1");
+
+    let frontier1 = next_resolved_checkpoint(&mut session, "gapped violation phase 1").await;
+    session.close().await.expect("close phase 1");
+
+    // P2 violates the producer protocol: a newer OUTSIDE with no rollback ACK
+    // for its still-open span.
+    pub2.enqueue(
+        |uuid| {
+            Ok((
+                0,
+                serde_json::json!({
+                    "_meta": {"uuid": uuid.to_string()},
+                    "id": "gv-p2-outside",
+                    "category": "alpha",
+                    "value": 21,
+                }),
+            ))
+        },
+        uuid::Flags::OUTSIDE_TXN,
+    )
+    .await
+    .unwrap();
+    pub2.flush().await.unwrap();
+
+    // Resume: P2's OUTSIDE triggers the backfill; the reconstruction is
+    // non-empty; the re-sequenced OUTSIDE fails the session. No checkpoint can
+    // become ready first — the backfill appends but commits nothing — so the
+    // first response is the teardown error.
+    let mut resumed = shuffle::SessionClient::open(
+        service,
+        build_task(materialization_spec),
+        build_shards(1, service.peer_endpoint(), &resume_dir),
+        frontier1.clone(),
+    )
+    .await
+    .expect("SessionClient::open resumed");
+
+    let err = match resumed.next_checkpoint().await {
+        Ok(frontier) => panic!("expected session teardown, got checkpoint: {frontier:?}"),
+        Err(err) => format!("{err:#}"),
+    };
+    assert!(
+        err.contains("OUTSIDE_TXN with a preceding unacknowledged CONTINUE_TXN"),
+        "expected OutsideWithPrecedingContinue teardown, got: {err}",
+    );
+    // The session tore down on error; there is no clean close to perform.
 }

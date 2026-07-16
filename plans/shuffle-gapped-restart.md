@@ -77,6 +77,55 @@ Within a shard log, clocks for one `(binding, journal, producer)` tuple are
 strictly ascending. This invariant is required by log scanning and downstream
 transaction reduction and MUST continue to hold.
 
+### Clock adjacency
+
+A CONTINUE following its producer's most recent ACK at clock `last_commit`
+carries a clock strictly greater than `last_commit + 1`. This is a normative
+protocol dependency of the gapped encoding: gapped state is recorded in-memory
+as the `max_continue == last_commit + 1` sentinel (see §Gapped state), and this
+axiom is what guarantees the sentinel never collides with a real pending span, so
+ordinary `uuid::sequence` classifies a gapped producer's documents correctly. As
+defense-in-depth, the runtime emits a tripwire warning if a gapped producer's
+CONTINUE is ever dropped as a duplicate at exactly the sentinel clock — a
+condition that is unconditionally an axiom violation.
+
+### Span-at-head marker
+
+A persisted `{last_commit: 0, offset: 0}` entry would be ambiguous: it could be
+a hint-only placeholder (a producer known only via a causal hint, with NO
+read-derived position) or a real CONTINUE span observed beginning at journal
+offset zero. The flush path therefore persists `last_commit = raw 1` — the
+*span-at-head marker* — for a real span at journal head, and `{0, 0}` then
+unambiguously means hint-only.
+
+Raw clock `1` can never collide with a real commit: a committing clock derives
+from wall-clock time and is astronomically larger. This is a normative axiom,
+beside §Clock adjacency. The marker is a persistence-only encoding: recovery
+normalizes it back to `Clock::zero()` in live state.
+
+A hint-only `{0, 0}` entry is NEVER gapped — it resumes from `M` like a
+committed entry, and this skips nothing. Safety argument: an entry of magnitude
+`M` was flushed only after the read passed `M`, and a sequential read that
+passed `M` sequenced everything below it. Had the hinted producer owned any
+document below `M`, sequencing it would have put the producer into the read's
+pending state and made its entry read-derived in the cumulative checkpoint —
+contradicting hint-only. Every one of a hint-only producer's documents
+therefore lies above `M`.
+
+Because `last_commit`-at-offset-zero is semantically load-bearing, Frontier
+machinery must respect the encoding. Reduction preserves the marker against a
+hint entry (`max(1, 0) = 1`; the equal-magnitude offset tie keeps zero) while
+read-derived progress supersedes it (a real `last_commit` and larger `|offset|`
+win). Hint *elevation* (`resolve_hints`) deliberately elevates a marker entry
+`{1, H, 0}` like any other, and this is safe: elevation fires only when
+read-derived progress for the same `(journal, binding, producer)` shows a real
+commit, which necessarily resolved the offset-zero span (committed or rolled it
+back), and the elevating checkpoint carries the `flushed_lsn` of the delivering
+documents. A later recovery from the elevated `{C > 1, 0}` therefore correctly
+classifies NOT gapped, and per-producer dedup drops any re-read duplicates.
+(Skipping elevation for marker entries would instead wedge the hint: the
+checkpoint pipeline's `unresolved` stage advances only through elevation.)
+
 ### Source-transaction atomicity
 
 Documents of one committed source transaction become visible together in a
@@ -110,27 +159,22 @@ Each recovered producer is classified as follows:
 | Checkpoint entry | Classification |
 |---|---|
 | Committed offset `-O` | Normal, with `last_commit` and committed end `O` recovered as today. |
-| Uncommitted begin `F == M` | Normal. The main read encounters the span from its beginning. |
-| Uncommitted begin `F`, where `F < M` | Gapped. The main read skips `[F, M)`. |
+| Uncommitted begin `F == M`, `F > 0` | Normal. The main read encounters the span from its beginning. |
+| Uncommitted begin `F`, where `0 < F < M` | Gapped. The main read skips `[F, M)`. |
+| Marker `{last_commit: raw 1, offset: 0}` | A real span begun at journal offset zero (§Span-at-head marker). The synthetic marker is normalized to zero in live state; gapped at `F = 0` when `M > 0`, normal when `M == 0`. |
+| Hint-only `{last_commit: 0, offset: 0}` | Normal, never gapped: resumes from `M` like a committed entry. |
+| Hint-elevated `{last_commit: C > 1, offset: 0}` | Normal, never gapped: the commit is already durably delivered (§Span-at-head marker). |
 
 Because `M` is the maximum magnitude, an uncommitted `F > M` is impossible.
 
-An entry with `offset == 0` may be a hint-only producer or a real span that
-began at journal offset zero. When `M > 0`, it is gapped with `F = 0`. A later
-commit may therefore require a targeted read from the beginning of the
-journal. This is no worse than today's conservative restart from zero.
-
-Hint projection does not make this case distinguishable. A real pending span
-at offset zero can also carry a non-zero `hinted_commit`, and Frontier reduction
-erases whether an offset-zero entry came only from a hint or also from committed
-state. Classifying apparent hint-only entries as normal would therefore risk
-skipping a real span. The conservative `F = 0` classification is deliberate.
-Although `[0, M)` is often dead weight for a true hint-only producer, that cost
-is paid only if the producer later emits a real document (the trigger); the
-backfill of `[0, trigger.begin)` then recovers its whole span, reading each byte
-once. Nothing is re-read: the main read never sequences a gapped producer's
-documents, so `[M, trigger.begin)` is scanned only by the backfill and the
-trigger onward only by the main read.
+The span-at-head marker makes `offset == 0` unambiguous, deleting an entire I/O
+class the previous conservative design carried: a hint-only producer is no
+longer *falsely* gapped at `F = 0`, so a later document from it no longer
+triggers a dead-weight whole-journal-prefix backfill of `[0, trigger.begin)`.
+Resuming a hint-only producer from `M` skips nothing (§Span-at-head marker).
+Nothing is re-read for genuinely gapped producers either: the main read never
+sequences a gapped producer's documents, so `[M, trigger.begin)` is scanned
+only by the backfill and the trigger onward only by the main read.
 
 The journal write head MUST NOT be used in place of `M`. Bytes between a
 checkpoint-derived position and the write head may contain transactions that
@@ -145,8 +189,11 @@ Consider an entry relative to `M`:
   that document as either a later commit or an uncommitted begin.
 - An uncommitted begin `F == M` is encountered from its first document by the
   main read.
-- An uncommitted begin `F < M` is the only case where documents are skipped.
-  The exact missing lower bound is retained as gap start `F`.
+- An uncommitted begin `F < M` — including a span-at-head marker at `F = 0` —
+  is the only case where documents are skipped. The exact missing lower bound
+  is retained as gap start `F`.
+- A hint-only `{0, 0}` entry needs no replay: all of its documents lie above
+  `M` (§Span-at-head marker).
 
 The argument remains inductive across later sessions because a gapped
 producer is frozen and omitted from progress until it resolves. Other
@@ -159,10 +206,11 @@ A producer is in one of three states:
 
 ```text
 normal  -> gapped        only during checkpoint recovery
-gapped -> normal         on clean/deep rollback or a newer OUTSIDE commit
-gapped -> backfilling    on the first newer non-duplicate document (CONTINUE or ACK)
+gapped -> normal         on clean/deep rollback only
+gapped -> backfilling    on the first newer non-duplicate document
+                         (CONTINUE, ACK, or OUTSIDE)
 backfilling -> normal    when the historical read completes and the trigger is
-                         re-sequenced — for a CONTINUE or ACK trigger alike
+                         re-sequenced — for any trigger kind alike
 ```
 
 The `gapped -> backfilling` transition happens at the trigger, before any
@@ -174,30 +222,38 @@ at the head of its read and is not yet sequenced.
 The `backfilling -> normal` transition happens at historical-read completion,
 which commits and installs nothing further: the reconstructed span is already
 the producer's pending state, so completion merely clears the Backfill. The
-next drain then re-sequences the still-buffered trigger, which extends the span
-(CONTINUE) or commits it (ACK) as an ordinary main-read document.
+next drain then re-sequences the still-buffered trigger as an ordinary
+main-read document: a CONTINUE extends the span, an ACK commits it, and an
+OUTSIDE either fails `OutsideWithPrecedingContinue` against a non-empty
+reconstruction (an evidenced protocol violation — terminal) or commits over an
+empty one (see §Main-read outcomes while gapped).
 
 Session failure discards in-memory transitions. Recovery reconstructs the
 appropriate state from the last durable checkpoint.
 
 ### Gapped state
 
-A gapped producer's entry is its ordinary `ProducerState` carrying an in-memory
-`gapped` bit. While the bit is set it retains:
+A gapped producer's entry is its ordinary `ProducerState`, marked gapped in-memory
+by the `max_continue == last_commit + 1` sentinel. While gapped it retains:
 
 - its recovered `last_commit`;
-- `max_continue = 0`; and
+- `max_continue = last_commit + 1` (the sentinel); and
 - its pinned uncommitted begin offset `F`, which is the entry's own `offset`.
 
-`F` is not stored separately: while the bit is set the entry is frozen, so
-`F == offset` by invariant, and only the four resolutions (backfill trigger,
-clean rollback, deep rollback, and a newer OUTSIDE commit) clear the bit. The
-bit is in-memory only — the persisted `ProducerFrontier` has no field for it, so
-it cannot leak durably, and recovery re-derives it in restart resolution. It is
-NOT fully derivable from `{last_commit, max_continue, offset}`: an empty backfill
-completion (`span_empty`) leaves `{last_commit, 0, F}`, indistinguishable from a
-still-gapped entry, so the bit is what records "already reconstructed, awaiting
-the trigger's re-sequencing" and prevents an infinite re-trigger loop.
+`F` is not stored separately: while gapped the entry is frozen, so `F == offset`
+by invariant, and three resolutions (backfill trigger, clean rollback, deep
+rollback) clear the sentinel. The sentinel is in-memory only — `max_continue` is
+not persisted in the `ProducerFrontier`, so it cannot leak durably, and recovery
+re-derives it in restart resolution. It can never arise organically: the
+clock-adjacency axiom (see §Clock adjacency) guarantees a real CONTINUE following
+the producer's ACK at `last_commit` has a clock strictly above `last_commit + 1`,
+and every committing/rolling-back outcome in `uuid::sequence` zeroes
+`max_continue`, so no real pending span ever lands on `last_commit + 1`.
+
+The state is therefore fully self-describing: an empty backfill leaves
+`{last_commit, 0, F}`, which is distinct from the gapped `{last_commit,
+last_commit + 1, F}`, so no separate marker is needed and no infinite re-trigger
+loop is possible after an empty backfill.
 
 While gapped:
 
@@ -209,8 +265,9 @@ While gapped:
   unchanged.
 
 An unrelated Slice-wide flush MAY include an unchanged producer entry carrying
-the same `last_commit` and `F` (the persisted frontier omits the in-memory bit).
-Only advancement or visibility is forbidden before resolution.
+the same `last_commit` and `F` (the persisted frontier omits the in-memory
+sentinel, and an entry at `F = 0` re-persists the span-at-head marker). Only
+advancement or visibility is forbidden before resolution.
 
 ### Main-read outcomes while gapped
 
@@ -220,32 +277,61 @@ causing a flush through the normal commit path.
 
 | Document | Required behavior |
 |---|---|
-| CONTINUE or ACK, clock `> last_commit` | Park the main read at this document (the *trigger*), clear the bit, install the reconstructed open span `{last_commit, 0, F}`, and begin a backfill of `[F, trigger.begin)`. The trigger is not sequenced now; it stays buffered at the head of its read and is sequenced by the normal read path once the backfill completes. |
-| CONTINUE, clock `<= last_commit` | Drop (duplicate); the bit stays set. |
-| ACK, clock `== last_commit` | Resolve as a clean rollback: clear the bit and emit commit progress with `offset = -ack_end`. Extract causal hints and flush. No historical I/O. |
-| ACK, clock `< last_commit` | Resolve directly as a deep rollback, without backfill: clear the bit, warn, set live `last_commit` to the ACK clock, set `offset = -ack_end`, extract causal hints, and flush. |
-| OUTSIDE, clock `> last_commit` | Clear the bit, then process the OUTSIDE commit normally. No historical I/O. |
-| OUTSIDE, clock `<= last_commit` | Drop (duplicate); the bit stays set. |
+| CONTINUE, ACK, or OUTSIDE, clock `> last_commit` | Park the main read at this document (the *trigger*), install the reconstructed open span `{last_commit, 0, F}` (which overwrites the sentinel), and begin a backfill of `[F, trigger.begin)`. The trigger is not sequenced now; it stays buffered at the head of its read and is sequenced by the normal read path once the backfill completes. For an OUTSIDE trigger that re-sequencing then either fails `OutsideWithPrecedingContinue` against a non-empty reconstruction (an *evidenced* protocol violation — terminal), or commits over an empty one. |
+| CONTINUE, clock `<= last_commit` | Drop (duplicate); the sentinel is untouched, so the gap survives. |
+| ACK, clock `== last_commit` | Resolve as a clean rollback: clear the gap and emit commit progress with `offset = -ack_end`. Extract causal hints and flush. No historical I/O. |
+| ACK, clock `< last_commit` | Resolve directly as a deep rollback, without backfill: clear the gap, warn, set live `last_commit` to the ACK clock, set `offset = -ack_end`, extract causal hints, and flush. |
+| OUTSIDE, clock `<= last_commit` | Drop (duplicate); the sentinel is untouched, so the gap survives. |
 
-A gapped producer's frozen `max_continue = 0` makes ordinary `uuid::sequence`
-misclassify these rows (rollbacks look like `AckDuplicate`, a newer CONTINUE
-looks like `ContinueBeginSpan`), so a gapped document is classified by this
-table rather than by the normal sequencer. A newer CONTINUE and a newer ACK are
-deliberately merged into one trigger row: any live document voids the
-presumption that the producer is dead, and for a CONTINUE the producer's
-remaining span and committing ACK are almost certainly just ahead in the
-journal.
+The governing principle for the OUTSIDE rows is exact parity with what a legacy
+conservative re-read derives from the same readable journal content. A gapped
+OUTSIDE cannot sequence against the merely-presumed span (the sentinel is a
+non-zero `max_continue`, which `uuid::sequence` rejects as
+`OutsideWithPrecedingContinue`), so a newer OUTSIDE becomes a backfill trigger
+exactly like CONTINUE and ACK: the historical read is how we find out whether
+the presumed span is real. If the backfill reconstructs a non-empty span, the
+re-sequenced OUTSIDE fails `OutsideWithPrecedingContinue` — now *evidenced*:
+readable content shows an open span followed by an OUTSIDE with no intervening
+rollback — and the session fail-fasts (a restart re-gaps and crash-loops,
+exactly as legacy conservative would on a real protocol violation). If the
+reconstruction is empty (the span was lost to retention or filtering), the
+OUTSIDE commits — matching what conservative re-reading derives over the same
+degraded content. The one-transaction invariant holds for `[F, outside.begin)`
+by the same checkpoint-closure argument as the other trigger kinds: no
+state-changing ACK sits unsequenced below `M`, and `[M, outside.begin)` holds
+no target-producer document, because the OUTSIDE is the first the main read
+reached.
 
-Treating `ACK == last_commit` as ordinary `AckDuplicate` is insufficient: it
-would clear only in-memory state while leaving positive offset `F` in the
-durable checkpoint. Rollback resolution MUST be reportable and durable even
-when no later producer document arrives.
+An OUTSIDE *duplicate* (clock `<= last_commit`) is a stale re-append of an old
+pre-span document under at-least-once journal semantics and implies nothing
+about the producer's current mode — a genuine open-span gap can coexist with a
+stale OUTSIDE duplicate landing above `M`. It drops with the frozen entry
+untouched, so the gap survives; dissolving it would let a later CONTINUE begin
+a fresh span at its own offset, silently dropping the skipped `[F, M)` span
+(violating correctness property 1).
 
-Frozen `max_continue = 0` would ordinarily hide a deep rollback behind
-`AckDuplicate`. The gap itself proves that a pending span exists, so an ACK
-below `last_commit` has the same semantics that conservative re-reading would
-derive after reconstructing `max_continue > 0`. No historical I/O is needed:
-the span is rolled back and none of its documents can become visible.
+The `max_continue == last_commit + 1` sentinel makes ordinary `uuid::sequence`
+the normative classifier for the CONTINUE and ACK rows — there is no separate
+gapped sequencer. A newer CONTINUE (`ContinueExtendSpan`) or ACK (`AckCommit`)
+is the trigger, an ACK at or below `last_commit` is a clean/deep rollback, and a
+duplicate CONTINUE (`ContinueDuplicate`) leaves the sentinel intact. The gapped
+OUTSIDE rows are classified directly by `sequence_producer` *before*
+`uuid::sequence` (which cannot sequence an OUTSIDE against the presumed span):
+newer means trigger, else drop, and either way the frozen state is returned
+untouched. Newer documents of all three kinds are deliberately merged into one
+trigger row: any live document voids the presumption that the producer is dead,
+and for a CONTINUE the producer's remaining span and committing ACK are almost
+certainly just ahead in the journal.
+
+The sentinel yields `AckCleanRollback` from `uuid::sequence` directly, so a clean
+rollback needs no special-casing. It must nonetheless be durable and reportable
+even when no later producer document arrives: it replaces the positive offset `F`
+with a committed `-ack_end`, so the gap does not return after restart.
+
+The gap itself proves that a pending span exists, so an ACK below `last_commit`
+is a deep rollback with the same semantics that conservative re-reading would
+derive after reconstructing `max_continue > 0`. No historical I/O is needed: the
+span is rolled back and none of its documents can become visible.
 
 Frontier reduction keeps `last_commit` monotonic, so a durable base may retain
 the older, higher `last_commit` even though the live sequencing state regresses.
@@ -253,22 +339,18 @@ The newer negative `offset` still wins by magnitude and durably clears the gap.
 This matches existing deep-rollback behavior and its producer-retirement
 assumption; a producer MUST NOT publish new clocks after any rollback.
 
-The OUTSIDE transition relies on the producer protocol: a compliant producer
-does not issue OUTSIDE while it has a pending CONTINUE span. Once a newer
-OUTSIDE is observed, the old span is not recoverable under protocol semantics.
-Processing the OUTSIDE normally avoids the permanent
-`OutsideWithPrecedingContinue` failure that a conservative re-read would
-otherwise produce.
-
 ## Backfill transaction
 
 ### Trigger and parking
 
-The first newer document (a CONTINUE or ACK with `clock > last_commit`)
-encountered for a gapped producer is the *trigger*. Both kinds trigger the same
-backfill: a live document of any kind voids the presumption that the producer is
-permanently dead, and for a CONTINUE the producer's remaining span and
-committing ACK are almost certainly already in the journal just ahead.
+The first newer document (a CONTINUE, ACK, or OUTSIDE with
+`clock > last_commit`) encountered for a gapped producer is the *trigger*. All
+three kinds trigger the same backfill: a live document of any kind voids the
+presumption that the producer is permanently dead, for a CONTINUE the
+producer's remaining span and committing ACK are almost certainly already in
+the journal just ahead, and for an OUTSIDE the historical read is what
+determines whether the presumed span is real (§Main-read outcomes while
+gapped).
 
 The main read MUST park at the trigger before sequencing it. The trigger is left
 buffered at the head of its read — it is neither popped nor shelved:
@@ -350,9 +432,13 @@ through the wholly normal path. Because the producer is no longer gapped and its
 pending state is the reconstructed open span:
 
 - a CONTINUE trigger sequences as `ContinueExtendSpan` (or `ContinueBeginSpan`
-  when the backfill found nothing) and appends; and
+  when the backfill found nothing) and appends;
 - an ACK trigger sequences as `AckCommit` and commits — causal hints, committed
-  offset, and flush — through the existing normal-path code.
+  offset, and flush — through the existing normal-path code; and
+- an OUTSIDE trigger sequences to `Err(OutsideWithPrecedingContinue)` against a
+  non-empty reconstruction — an evidenced protocol violation, terminal via the
+  existing fail-fast teardown — or to `OutsideCommit` over an empty one
+  (§Main-read outcomes while gapped).
 
 Reconstructing into pending at the trigger is durably safe, and is why there is
 no atomic visibility boundary to enforce. `max_continue` is not persisted in the
@@ -371,10 +457,11 @@ gap, and repeats idempotently.
 
 An empty reconstructed span (no target CONTINUEs found) is possible only when
 historical documents were unavailable or filtered by existing journal-read
-semantics, or benignly for a hint-only producer backfilled from `F = 0`; the
-completion event reports it as `span_empty`. Under a CONTINUE trigger the
-re-sequenced document then sequences as `ContinueBeginSpan` and the span simply
-begins at the trigger.
+semantics; the completion event reports it as `span_empty`. (A hint-only
+producer is never gapped and so never backfills — see §Span-at-head marker.)
+Under a CONTINUE trigger the re-sequenced document then sequences as
+`ContinueBeginSpan` and the span simply begins at the trigger; under an OUTSIDE
+trigger it commits.
 
 ## Ordering and scheduling
 
@@ -458,12 +545,14 @@ advances to the trigger's end offset, and the main read continues past it.
 ## Causal hints and recovery checkpoints
 
 An unresolved hint (`hinted_commit > last_commit`) needs no special replay
-path. If the hinted producer is gapped, the target journal reaches a newer
-document, triggers a backfill, and — once the backfill completes and the buffered
-ACK trigger is sequenced by the normal path — resolves the hint through the
-ordinary commit Frontier, exactly as a live ACK would. Hints are therefore
-extracted by the normal path when the ACK is consumed, not by any backfill-
-specific code.
+path. A hint-only producer (`{0, H, 0}`, never gapped — §Span-at-head marker)
+resumes from `M` and resolves its hint when the main read reaches its commit,
+which lies above `M`. If a hinted producer is *also* gapped (a real span plus a
+hint), the target journal reaches a newer document, triggers a backfill, and —
+once the backfill completes and the buffered ACK trigger is sequenced by the
+normal path — resolves the hint through the ordinary commit Frontier, exactly
+as a live ACK would. Hints are therefore extracted by the normal path when the
+ACK is consumed, not by any backfill-specific code.
 
 The trigger cannot have been fully sequenced by a prior checkpoint; otherwise
 its `last_commit` would already reflect it. The existing checkpoint peek
@@ -498,7 +587,7 @@ gapped producer state is discarded with the rest of that read. A later listing
 appearance is a new read and may start without the removed read's producer
 checkpoint. Because deletion and FULL suspension imply that no fragments remain,
 the new read has no historical span to recover. A discarded read's in-memory
-gapped bits are left inert rather than actively cleared: the read is never
+gapped sentinels are left inert rather than actively cleared: the read is never
 re-served (its slot is not reused) and nothing downstream consumes them.
 
 When the *backfill's historical read* observes removal, it is treated as an
@@ -549,13 +638,16 @@ avoid document content.
 Required events are:
 
 - gap creation, with `F` and `M`;
-- backfill trigger, with `F`, `trigger_begin`, and whether the trigger is an ACK;
+- backfill trigger, with `F`, `trigger_begin`, and the trigger kind
+  (continue / ack / outside);
 - backfill completion, with range bytes, physical bytes read, duration, and
-  `span_empty` (a fragment-loss indicator, also benign for a hint-only producer
-  backfilled from `F = 0`);
+  `span_empty` (a fragment-loss indicator); and
 - gap resolution by clean or deep rollback, including which outcome occurred
-  and confirmation that no historical I/O was issued; and
-- gap resolution by OUTSIDE.
+  and confirmation that no historical I/O was issued.
+
+There is no dedicated OUTSIDE-resolution event: a gapped OUTSIDE resolves
+through the backfill machinery, so the trigger-kind and completion events
+subsume it.
 
 A journal removed during a backfill completes it as an implicit EOF, so it is
 reported through the ordinary backfill-completion event (the removal is noted as
@@ -674,8 +766,7 @@ hold:
 
 1. **No committed transaction is skipped.** Normal producers are read from a
    checkpoint-derived position; every skipped gapped span is recovered before
-   a committing ACK is sequenced, or is durably discarded by rollback or a
-   newer OUTSIDE commit.
+   a committing ACK is sequenced, or is durably discarded by rollback.
 2. **Exactly-once delivery is preserved.** The recovered span's appends split
    across two disjoint ranges — the backfill covers `[F, trigger.begin)` and the
    main read covers the trigger onward. A gapped producer's main-read documents
@@ -714,7 +805,6 @@ generator must add sessions in which:
 - the gapped producer cleanly rolls back at `last_commit`;
 - the gapped producer deeply rolls back below `last_commit`, resolving without
   historical I/O;
-- the gapped producer writes a newer OUTSIDE document;
 - multiple live producers have clustered open spans in one journal;
 - multiple far-behind producers are gapped in one journal;
 - a gapped transaction spans multiple journals and resolves causal hints; and
@@ -723,11 +813,30 @@ generator must add sessions in which:
 
 Deterministic coverage must additionally verify:
 
-- `M` resolution and gap classification, including `offset == 0`;
+- `M` resolution and gap classification, including all three `offset == 0`
+  encodings: the span-at-head marker `{raw 1, 0}` (gapped when `M > 0`, normal
+  and normalized when `M == 0`), hint-only `{0, 0}` (never gapped), and
+  hint-elevated `{C > 1, 0}` (never gapped);
+- the flush path persists the span-at-head marker for a pending span at journal
+  offset zero, and only for the exact `{last_commit: 0, offset: 0}` shape;
+- Frontier reduction preserves the marker against hint entries while
+  read-derived progress supersedes it, and hint elevation (`resolve_hints`)
+  deliberately elevates a marker entry carrying an unresolved hint (see
+  §Span-at-head marker for why unconditional elevation is safe);
+- a recovered hint-only producer sequences its later commit at-or-above `M`
+  organically, with no backfill trigger;
+- a real span at `F = 0` round-trips through the marker and is still gapped on
+  resume, with unchanged recovery behavior;
 - the complete gapped outcome table;
 - a CONTINUE-triggered backfill that later commits via the main-read ACK;
 - an ACK-triggered backfill (all CONTINUEs below `M`) that commits when the
   buffered trigger is sequenced on completion;
+- a gapped producer's newer OUTSIDE is a backfill trigger (no append, no
+  commit, frozen state returned untouched), while an OUTSIDE duplicate drops
+  with the gap intact;
+- a re-sequenced OUTSIDE trigger fails `OutsideWithPrecedingContinue` against a
+  non-empty reconstructed span — tearing the session down, as an evidenced
+  protocol violation — and commits over an empty reconstruction;
 - an empty backfill under a CONTINUE trigger reports `span_empty` and the span
   begins at the trigger;
 - a flush landing during the backfill, or between completion and the buffered
@@ -748,8 +857,6 @@ Deterministic coverage must additionally verify:
   stops through its ordinary removal path;
 - FULL suspension of a main read's journal releases its gapped state after
   fragments are gone, and a later appearance starts fresh;
-- an ambiguous hinted producer with `offset == 0` is conservatively backfilled
-  from zero and commits its post-`M` skipped span;
 - main-read byte deltas remain monotonic and exclude physical backfill bytes;
 - backfill trigger and completion interact correctly with `recovery_pending`
   and the first checkpoint's peek/gating; and

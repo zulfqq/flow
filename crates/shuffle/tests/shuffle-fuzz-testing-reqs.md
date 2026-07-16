@@ -95,18 +95,27 @@ timing within the pipeline. The test driver must be prepared for either case.
 ### Recovery model
 
 When a session "crashes" (closes) after processing transactions but before the
-downstream consumer has fully applied them, the consumer can recover by
-opening a new session with a **resume checkpoint** that encodes which
-transactions need to be replayed.
+downstream consumer has fully applied them, the consumer recovers by opening a
+new session with a **resume checkpoint**. Recovery rests on two mechanisms:
 
-The key mechanism is **hints projection**: the consumer takes the frontier from
-the incomplete round (which has `last_commit` values for producers that
-committed) and projects those `last_commit` values into `hinted_commit` fields
-in a new frontier where everything else is zeroed. This projection is then
-`reduce()`d into the cumulative recovery frontier:
+**Committed-checkpoint recovery** is the general path, for every commit. The
+resumed session starts each `(binding, journal)` read at the furthest position
+its recovered checkpoint justifies (`M = max(|offset|)`), re-reads everything
+above it — which is exactly the crash round's writes, since prior rounds'
+positions are already in the cumulative recovery frontier — and re-commits the
+crash round's transactions at their original clocks. The driver polls
+`next_checkpoint` until every committing producer of the crash round is
+visible again, then scans.
+
+**Hints projection** additionally models the durable causal hints production
+creates. Production extracts hints only from ACK_TXN documents of transactions
+spanning >= 2 journals (each journal's ACK names the txn's *other* journals),
+so the driver projects hint-only entries ONLY for producers whose round action
+committed such a transaction:
 
 ```
-projection = for each (binding, journal, producer) in round_frontier:
+projection = for each (binding, journal, producer) in round_frontier
+             where producer committed a multi-journal ACK txn this round:
     ProducerFrontier {
         producer,
         last_commit: Clock::default(),      // zeroed
@@ -116,16 +125,21 @@ projection = for each (binding, journal, producer) in round_frontier:
 recovery = recovery.reduce(projection)
 ```
 
-Because `reduce()` takes element-wise max, the recovery frontier now has:
-- `last_commit` from prior rounds (the confirmed baseline thus far for ALL journals and producers)
-- `hinted_commit` from the incomplete round (what needs to be replayed)
+A standalone OUTSIDE commit or a single-journal ACK never yields a hint — those
+commits are recovered purely by the committed-checkpoint path. This fidelity
+matters: projecting a hint for every committed producer would (a) manufacture a
+recovery-checkpoint isolation guarantee production doesn't provide, and (b)
+project synthetic non-commit `last_commit` encodings — the span-at-head marker
+(raw 1) persisted for an uncommitted span at journal offset zero — as
+`hinted_commit` values that can never resolve, stalling the pipeline.
 
-When the new session opens with this recovery frontier, the
-`CheckpointPipeline` detects producers with `hinted_commit > last_commit` and
-sets `recovery_pending = true`. This **blocks** new progress from being
-promoted to `ready` until the recovery checkpoint is consumed. The first
-`NextCheckpoint` from the new session reflects exactly the recovered
-transaction — the same documents that were committed in the original session.
+When the new session opens with unresolved hints (`hinted_commit >
+last_commit`), the `CheckpointPipeline` sets `recovery_pending = true`,
+blocking new progress from promotion until the recovery checkpoint (exactly the
+hinted producers, resolved by the re-read) is consumed. The driver's crash-round
+polling reduces through any recovery peeks, the recovery checkpoint, and
+subsequent deltas until all hints resolve AND all crash-round commits are
+visible.
 
 **Important**: This hints projection is a **client-side operation** that does
 not exist in the shuffle crate. The fuzz test must implement it. It is not the
@@ -191,7 +205,9 @@ Two actions create *stale open spans*:
   open (no ACK). If a crash intervenes before the span commits, and the span's
   begin offset was captured in a flushed checkpoint (because another producer
   committed in the same journal), it becomes a positive-offset entry in the
-  recovery checkpoint.
+  recovery checkpoint — or a *span-at-head marker* entry (`last_commit = raw 1`,
+  `offset = 0`) when the span begins at journal offset zero, which recovery
+  distinguishes from a hint-only `{0, 0}` placeholder.
 - `CommitOpen` later ACKs that span.
 
 A recovered open span beginning before `M` is *gapped*: the main read skips it
@@ -343,16 +359,21 @@ For each round:
      stays empty, which is a valid frontier that surfaces no documents).
 
   4. PROJECT HINTS INTO RECOVERY:
-     Create a projection of round_frontier where each producer's
-     last_commit becomes hinted_commit, with all other fields zeroed.
-     Reduce this projection into recovery:
+     Create a projection of round_frontier restricted to producers whose
+     round action committed a multi-journal ACK txn (see Recovery model),
+     with each such producer's last_commit becoming hinted_commit and all
+     other fields zeroed. Reduce this projection into recovery:
        recovery = recovery.reduce(projection)
 
-  5. WRITE NEXT ROUND (if not last):
+  5. WRITE NEXT ROUND (if not last AND not crashing):
      Execute the next round's journal writes immediately. This creates
      an intentional race: the next round's data is in the journals, but
      the current round's frontier gates visibility. The FrontierScan in
      step 7 must see only the current round's committed documents.
+     Skipped on crash rounds: the resumed session re-reads everything
+     above the recovered checkpoint (step 6), and pre-written next-round
+     commits would be indistinguishable from the crash round's own
+     recovered commits.
 
   6. MAYBE CRASH AND RESTART (if round.crash is true):
      a. session.close() — reads EOF, ensures clean teardown, deletes
@@ -365,10 +386,14 @@ For each round:
             journals: vec![],
             flushed_lsn: recovery.flushed_lsn.clone(),
         }
-     f. If recovery has unresolved hints (any producer with
-        hinted_commit > last_commit): read first NextCheckpoint from
-        the new session. This is the recovery checkpoint — it replaces
-        round_frontier. (See "Why only with hints" below.)
+     f. If the round had commits, or recovery has unresolved hints:
+        loop next_checkpoint(), reducing each response (recovery peeks,
+        the recovery checkpoint, and subsequent deltas alike) into
+        round_frontier, until round_frontier has no unresolved hints AND
+        the polling termination condition holds for this round's commit
+        clocks. The resumed session re-reads above the recovered
+        checkpoint and re-commits the crash round's transactions
+        (committed-checkpoint recovery).
 
   7. SCAN: For each shard (0..N), drive FrontierScan with round_frontier
      and a shard-specific Reader. Collect all entries across shards into
@@ -413,28 +438,27 @@ condition is trivially satisfied and we loop zero times. The `round_frontier`
 stays as initialized (empty journals, recovery's `flushed_lsn`). This is a
 valid frontier that `FrontierScan` will scan to produce zero documents.
 
-### Why Crash Only Works With Hints
+### Why Crash Rounds Skip Pre-Writing
 
-When a session opens with a resume checkpoint containing unresolved hints
-(`hinted_commit > last_commit`), the `CheckpointPipeline` sets
-`recovery_pending = true`. This **blocks** new progress from being promoted
-to `ready`, ensuring the first `NextCheckpoint` is exactly the recovery
-checkpoint — isolated from any new data in the journals.
+Crash-round verification is *positive*: the driver polls the resumed session
+until the crash round's commits reappear, rather than relying on hints to
+isolate a recovery checkpoint (only multi-journal ACK commits project hints, so
+most commits have none). The resumed session re-reads everything above the
+recovered checkpoint — if the next round had been pre-written (step 5), its
+commits would be re-read and re-committed alongside the crash round's, and the
+scan could not distinguish them. Skipping pre-writing on crash rounds makes the
+re-read content exactly the crash round's writes.
 
-Without unresolved hints, `recovery_pending` is false. The first
-`NextCheckpoint` would include **all** progress, including documents from
-the next round (which was already written in step 5). The test driver cannot
-distinguish current-round recovery from next-round progress.
+The trade-off is deliberate: the pre-write visibility race is still exercised
+by every non-crash round, while crash rounds gain end-to-end coverage of
+committed-checkpoint recovery — checkpoint skip-ahead (`M` resolution), gap
+classification (including span-at-head markers for open spans at journal offset
+zero), and backfill of gapped spans committed by a post-crash `CommitOpen`.
 
-The test handles both cases correctly:
-- **With hints**: Read the first `NextCheckpoint` as the recovery checkpoint
-  (step 6f). It replaces `round_frontier` with the recovered state, which
-  should match the original round's committed documents.
-- **Without hints**: Skip the recovery `NextCheckpoint` (step 6f). The
-  `round_frontier` stays empty (re-initialized in step 6e). Scanning produces
-  zero documents, which is correct — there is nothing to recover. This still
-  exercises the restart path (session close, new session open, fresh reader
-  state) even without testing the recovery invariant.
+When the recovery frontier does carry unresolved hints, `recovery_pending`
+still gates promotion in the pipeline; the driver's unified polling loop (step
+6f) reduces through recovery peeks and the recovery checkpoint exactly as it
+reduces subsequent deltas.
 
 ### Why Not Zero the Recovery Frontier
 
@@ -452,9 +476,9 @@ to resume reading in the Gazette journals.
 
 ### Why Write the Next Round Before Scanning
 
-The test deliberately writes the next round's actions to journals (step 5)
-before scanning the current round's frontier (step 7). This creates a race
-that stresses shuffle's visibility guarantees:
+On non-crash rounds, the test deliberately writes the next round's actions to
+journals (step 5) before scanning the current round's frontier (step 7). This
+creates a race that stresses shuffle's visibility guarantees:
 
 - The Slice actors will pick up the next round's documents from the journals
   and route them to the Log actor, writing new log blocks.
@@ -464,8 +488,9 @@ that stresses shuffle's visibility guarantees:
 - The oracle asserts that only the current round's committed documents appear.
   Any leakage from the next round would be caught.
 
-This ordering is critical. If we scanned first and wrote the next round after,
-we would lose this coverage.
+If we scanned first and wrote the next round after, we would lose this
+coverage. Crash rounds are the exception (see "Why Crash Rounds Skip
+Pre-Writing").
 
 ### Why Not Mix OUTSIDE_TXN and CONTINUE/ACK Per Producer
 

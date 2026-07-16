@@ -267,23 +267,46 @@ The top document is sequenced against per-producer state using
 
 A producer whose uncommitted span begins before the resolved start offset `M`
 is *gapped* (`slice/gap.rs`): its recovered `ProducerState` is frozen in
-`settled` with its in-memory `gapped` bit set, and while set its `offset` is the
-pinned span begin `F`. (The bit cannot be fully derived from
-`{last_commit, max_continue, offset}` — an empty backfill leaves `{last_commit, 0, F}`,
-indistinguishable from a still-gapped entry — so it is stored explicitly; it is
-in-memory only, and `resolve_checkpoint` re-derives it on restart.) The main
-read's documents for a gapped producer are classified by `sequence_gapped` rather
-than `uuid::sequence` — whose frozen `max_continue == 0` would misreport them —
-into: drop (a duplicate), a durable clean/deep rollback (an ACK at or below
-`last_commit` clears the bit with a committed `-ack_end`, no historical I/O), a
-newer OUTSIDE that clears the bit, or a backfill *trigger* — the first newer
-document, CONTINUE or ACK.
+`settled` carrying the `max_continue == last_commit + 1` sentinel
+(`ProducerState::is_gapped`), and while gapped its `offset` is the pinned span
+begin `F`. The sentinel is in-memory only (`ProducerFrontier` has no
+`max_continue` field, so it cannot leak durably; `resolve_checkpoint` re-derives
+it on restart) and can never arise organically — the clock-adjacency axiom
+guarantees a real CONTINUE following the producer's ACK at `last_commit` has a
+clock strictly above `last_commit + 1`. So a gapped producer's documents are
+classified by the ordinary `uuid::sequence` — the single sequencing path, no
+bespoke classifier — correctly by construction: drop (a duplicate CONTINUE, which
+leaves the sentinel intact so the gap survives); a durable clean/deep rollback (an
+ACK at or below `last_commit` overwrites `F` with a committed `-ack_end`, no
+historical I/O); or a backfill *trigger* — the first newer document, CONTINUE or
+ACK. The sentinel being distinct from a reconstructed-empty span `{L, 0, F}`
+(versus gapped `{L, L+1, F}`) is what makes the state self-describing and an empty
+backfill safe against re-triggering. A gapped producer's OUTSIDE cannot sequence
+against the merely-presumed span (the sentinel would make `uuid::sequence` reject
+it as `OutsideWithPrecedingContinue`), so `sequence_producer` classifies it
+directly: a *newer* OUTSIDE is a backfill trigger exactly like CONTINUE and ACK —
+the historical read determines whether the presumed span is real, after which the
+re-sequenced OUTSIDE either fails `OutsideWithPrecedingContinue` against a
+non-empty reconstruction (an evidenced protocol violation — terminal, exactly as
+a legacy conservative re-read of the same content would fail) or commits over an
+empty one — while a *duplicate* OUTSIDE is a stale re-append that drops with the
+gap intact. These are the three resolutions that clear a gap: backfill trigger
+(first newer CONTINUE, ACK, or OUTSIDE), clean rollback, deep rollback.
+
+A pending span that begins at journal offset zero is persisted with the
+*span-at-head marker* (`last_commit = raw 1`, a clock no real commit can carry
+— `frontier::SPAN_AT_HEAD_MARKER`), so recovery can distinguish it from a
+hint-only placeholder `{last_commit: 0, offset: 0}`. A hint-only producer is
+never gapped: it resumes from `M` like a committed entry, which skips nothing
+(all of its documents lie above `M` — see the spec's §Span-at-head marker for
+the safety argument, and for why hint elevation deliberately elevates marker
+entries).
 
 On a trigger the main read *parks*, but the trigger is **not** popped or shelved:
 it stays buffered at the head of its read in the ready heap. At trigger time the
 actor reconstructs the recovered open span directly into the read's ordinary
-`pending` map as `{last_commit, max_continue: 0, offset: F, gapped: false}` —
-which both installs the span and clears the gapped marker — and opens a bounded
+`pending` map as `{last_commit, max_continue: 0, offset: F}` — which both installs
+the span and overwrites the sentinel (clearing the gap) — and opens a bounded
 historical read of `[F, trigger.begin)` held in the single actor-owned `Backfill`
 (`SliceActor::backfill`: the historical read's I/O state, `BackfillIo` — either
 `Reading` the next batch or `Draining` a resolved one — plus the bookkeeping to
@@ -304,7 +327,9 @@ completion is reported (range/physical bytes, duration, `span_empty`). The next
 drain iteration pops the trigger — now that the producer is no longer gapped and
 its `pending` state is the reconstructed span — and sequences it through the
 wholly-normal path: a CONTINUE extends the span and appends, an ACK commits it
-(causal hints, offset, flush). This is durably safe because `max_continue` is not
+(causal hints, offset, flush), and an OUTSIDE either fails
+`OutsideWithPrecedingContinue` against a non-empty reconstruction (terminal) or
+commits over an empty one. This is durably safe because `max_continue` is not
 persisted and the span's `offset` stays at `F`, which the durable checkpoint
 already records, so a flush carrying it changes nothing durably; visibility stays
 gated by the absence of an ACK. There is thus no atomic visibility boundary to
@@ -338,7 +363,7 @@ draining resumes and the trigger is re-sequenced.
 
 Gap state is never persisted; recovery is derived entirely from the durable
 producer checkpoint. When a read stops or the session ends its in-memory gapped
-bits are left inert (the read is never re-served); only an active backfill is
+sentinels are left inert (the read is never re-served); only an active backfill is
 torn down, releasing its in-flight historical read (the triggering main read is
 in the heap and stops through its own path). A journal removed *during* a backfill
 is treated as an implicit EOF: the backfill completes with whatever span was

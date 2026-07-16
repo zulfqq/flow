@@ -55,8 +55,8 @@ pub(crate) struct Metrics {
     /// Number of reads currently pending AND non-tailing: parked awaiting broker
     /// I/O while behind their write head, head-of-line-blocking the heap drain.
     stalled_reads: metrics::Gauge,
-    /// Backfills triggered (a gapped producer's committing ACK was observed).
-    /// `backfills_started - backfills_stopped` is the in-flight backfill count.
+    /// Backfills triggered (a gapped producer's first newer CONTINUE, ACK, or
+    /// OUTSIDE). `backfills_started - backfills_stopped` is the in-flight count.
     backfills_started: metrics::Counter,
     /// Backfills that have either completed or failed.
     backfills_stopped: metrics::Counter,
@@ -99,7 +99,7 @@ impl Metrics {
             metrics::describe_counter!(
                 "shuffle_slice_backfills_started",
                 metrics::Unit::Count,
-                "backfills triggered by a gapped producer's committing ACK",
+                "backfills triggered by a gapped producer's first newer CONTINUE, ACK, or OUTSIDE",
             );
             metrics::describe_counter!(
                 "shuffle_slice_backfills_stopped",

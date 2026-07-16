@@ -18,42 +18,65 @@ use proto_gazette::uuid::{Clock, Producer};
 ///   - Non-negative: Begin offset of first pending CONTINUE_TXN
 ///   - Negative: Negation of end offset of last committing ACK_TXN / OUTSIDE_TXN
 /// Internal default state uses zero before any document has been observed.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct ProducerState {
     /// Clock of the last committing ACK_TXN or OUTSIDE_TXN.
     pub last_commit: Clock,
     /// Maximum Clock of an uncommitted CONTINUE_TXN, or zero if no pending span.
+    ///
+    /// Doubles as the in-memory *gapped* sentinel: a producer is gapped iff
+    /// `max_continue == last_commit + 1` (see [`ProducerState::is_gapped`]). The
+    /// sentinel can never arise organically. The clock-adjacency protocol axiom
+    /// guarantees a real CONTINUE_TXN following its producer's ACK at `last_commit`
+    /// carries a clock strictly greater than `last_commit + 1`, and every
+    /// committing or rolling-back outcome in `uuid::sequence` zeroes `max_continue`
+    /// — so no real pending span ever lands on `last_commit + 1`. Encoding gapped
+    /// this way makes `uuid::sequence` the single, normative classifier for a
+    /// gapped producer's documents: a newer CONTINUE/ACK extends or commits the
+    /// span (the backfill trigger), an ACK at or below `last_commit` is a
+    /// clean/deep rollback, and a duplicate passes through with `max_continue`
+    /// unchanged (the gap survives). The one non-`uuid::sequence` row is a gapped
+    /// OUTSIDE, which cannot sequence against the merely-presumed span:
+    /// `sequence_producer` classifies it directly — a newer OUTSIDE is a backfill
+    /// trigger, a duplicate drops with the gap intact.
+    ///
+    /// In-memory only: `ProducerFrontier` has no `max_continue` field, so the
+    /// sentinel cannot leak into a durable checkpoint, and recovery re-derives it
+    /// in `resolve_checkpoint`. While gapped, `offset` is the pinned gap begin `F`,
+    /// and three resolutions clear it — a backfill trigger (the first newer
+    /// CONTINUE, ACK, or OUTSIDE), a clean rollback, or a deep rollback (see
+    /// `sequence_producer` and `plans/shuffle-gapped-restart.md` §Gapped state).
+    ///
+    /// The sentinel makes the state fully self-describing: a reconstructed-empty
+    /// span `{L, 0, F}` is distinct from a gapped `{L, L+1, F}`, which is what
+    /// prevents an infinite re-trigger loop after an empty backfill. Operator note:
+    /// a sequencing-failure error context prints this synthetic `max_continue` one
+    /// tick above `last_commit`.
     pub max_continue: Clock,
     /// Journal byte offset, sign-encoded (see struct docs).
     pub offset: i64,
-    /// Whether this producer is *gapped*: its uncommitted span begins at `offset`
-    /// (`F`) below the restart position `M`, so the main read skipped `[F, M)` and
-    /// the entry is frozen until it resolves (see `plans/shuffle-gapped-restart.md`
-    /// §Gapped state). Freeze invariant: while set, `offset` is the pinned `F` and
-    /// only the four resolutions — backfill trigger, clean rollback, deep rollback,
-    /// and a newer OUTSIDE commit — clear it.
-    ///
-    /// In-memory only: `ProducerFrontier` has no corresponding field, so the bit
-    /// cannot leak durably and recovery re-derives it in `resolve_checkpoint`. It
-    /// is NOT fully derivable from `{last_commit, max_continue, offset}`: an empty
-    /// backfill completion (`span_empty`) leaves `{last_commit, 0, F}`,
-    /// indistinguishable from a still-gapped entry. The bit records "already
-    /// reconstructed, awaiting the trigger's re-sequencing", preventing an infinite
-    /// re-trigger loop.
-    pub gapped: bool,
 }
 
-impl Default for ProducerState {
-    fn default() -> Self {
-        Self {
-            last_commit: Clock::zero(),
-            max_continue: Clock::zero(),
-            offset: 0,
-            gapped: false,
-        }
+impl ProducerState {
+    /// Whether this producer is *gapped* (see [`ProducerState::max_continue`]): its
+    /// uncommitted span begins at `offset` (`F`) below the restart position `M`, so
+    /// the main read skipped `[F, M)` and the entry is frozen until it resolves.
+    /// Encoded as the `max_continue == last_commit + 1` sentinel, which the
+    /// clock-adjacency axiom guarantees a real pending span can never produce.
+    pub fn is_gapped(&self) -> bool {
+        // `wrapping_add` only to be total; a real clock is nowhere near u64::MAX,
+        // so the wrap can never occur.
+        self.max_continue.as_u64() == self.last_commit.as_u64().wrapping_add(1)
+    }
+
+    /// Mark this producer gapped by installing the `last_commit + 1` sentinel into
+    /// `max_continue`. Called during checkpoint recovery for an uncommitted span
+    /// whose begin `F` precedes `M`.
+    pub fn mark_gapped(&mut self) {
+        self.max_continue = Clock::from_u64(self.last_commit.as_u64() + 1);
     }
 }
-const _: () = assert!(std::mem::size_of::<ProducerState>() == 32);
+const _: () = assert!(std::mem::size_of::<ProducerState>() == 24);
 
 /// Build a [`crate::Frontier`] by reducing read-derived producer state with
 /// causal hints.
@@ -85,7 +108,21 @@ pub fn build_flush_frontier(
             .iter()
             .map(|(producer, ps)| crate::ProducerFrontier {
                 producer: *producer,
-                last_commit: ps.last_commit,
+                // A real pending span begun at journal offset zero persists the
+                // SPAN_AT_HEAD_MARKER (raw `last_commit = 1`) in place of
+                // `Clock::zero()`, so recovery can distinguish it from a
+                // hint-only placeholder `{0, 0}` and gap it. `last_commit` at
+                // `offset == 0` is a load-bearing encoding — see the constant's
+                // docs. This covers both a live span begun at offset zero
+                // (ContinueBeginSpan) and a frozen gapped entry at `F = 0`
+                // re-inserted by a duplicate-drop, whose recovered (normalized)
+                // `last_commit` is likewise zero. The hints loop below never
+                // emits the marker: hint-only entries keep `last_commit: 0`.
+                last_commit: if ps.offset == 0 && ps.last_commit == Clock::zero() {
+                    Clock::from_u64(crate::frontier::SPAN_AT_HEAD_MARKER)
+                } else {
+                    ps.last_commit
+                },
                 hinted_commit: Clock::zero(),
                 offset: ps.offset,
             })
@@ -196,7 +233,6 @@ mod test {
                     last_commit: Clock::from_u64(last_commit),
                     max_continue: Clock::zero(),
                     offset,
-                    gapped: false,
                 },
             );
         }
@@ -340,6 +376,21 @@ mod test {
                 "duplicate_hints_merged_with_reads",
                 vec![read_state("journal/A", 0, &[(0x01, 50, -300)])],
                 vec![hint("journal/A", 0, &[(0x01, 100), (0x01, 200)])],
+            ),
+            // Span-at-head marker: a pending span at journal offset zero with no
+            // prior commit persists `last_commit = SPAN_AT_HEAD_MARKER` (raw 1),
+            // so recovery can distinguish it from a hint-only `{0, 0}` entry.
+            // Only the exact `{last_commit: 0, offset: 0}` shape is marked: a
+            // span at `F > 0` and an offset-zero entry with a real `last_commit`
+            // pass through, and hint-loop entries keep `last_commit: 0`.
+            (
+                "span_at_head_marker",
+                vec![read_state(
+                    "journal/A",
+                    0,
+                    &[(0x01, 0, 0), (0x03, 0, 700), (0x05, 90, 0)],
+                )],
+                vec![hint("journal/B", 0, &[(0x07, 150)])],
             ),
         ];
 

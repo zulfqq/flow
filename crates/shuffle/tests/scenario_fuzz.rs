@@ -736,36 +736,119 @@ fn polling_complete(
     true
 }
 
-/// Client-side hints projection: project last_commit → hinted_commit.
-fn project_hints(round_frontier: &shuffle::Frontier) -> shuffle::Frontier {
+/// Client-side hints projection with production hint fidelity: project
+/// `last_commit → hinted_commit`, but ONLY for producers in `qualifying`.
+///
+/// Production extracts causal hints exclusively from ACK_TXN documents of
+/// transactions spanning >= 2 journals (each journal's ACK names the txn's
+/// *other* journals), so only such a producer can ever appear as a hint-only
+/// entry in a real recovery checkpoint. A standalone OUTSIDE commit or a
+/// single-journal ACK never yields a hint — those commits are recovered across
+/// a crash via committed-checkpoint recovery instead (see STEP 6). Filtering
+/// also keeps synthetic non-commit `last_commit` encodings (the span-at-head
+/// marker, raw 1, persisted for an uncommitted span at journal offset zero)
+/// from ever being projected as a `hinted_commit`, which could never resolve.
+fn project_hints(
+    round_frontier: &shuffle::Frontier,
+    qualifying: &HashSet<uuid::Producer>,
+) -> shuffle::Frontier {
     let journals: Vec<shuffle::JournalFrontier> = round_frontier
         .journals
         .iter()
-        .map(|jf| shuffle::JournalFrontier {
-            binding: jf.binding,
-            journal: jf.journal.clone(),
-            producers: jf
+        .filter_map(|jf| {
+            let producers: Vec<shuffle::ProducerFrontier> = jf
                 .producers
                 .iter()
+                .filter(|pf| qualifying.contains(&pf.producer))
                 .map(|pf| shuffle::ProducerFrontier {
                     producer: pf.producer,
                     last_commit: uuid::Clock::zero(),
                     hinted_commit: pf.last_commit,
                     offset: 0,
                 })
-                .collect(),
-            bytes_read_delta: 0,
-            bytes_behind_delta: 0,
+                .collect();
+
+            // Drop journals with no qualifying producer, keeping the projected
+            // frontier minimal and its unresolved-hint count exact.
+            if producers.is_empty() {
+                None
+            } else {
+                Some(shuffle::JournalFrontier {
+                    binding: jf.binding,
+                    journal: jf.journal.clone(),
+                    producers,
+                    bytes_read_delta: 0,
+                    bytes_behind_delta: 0,
+                })
+            }
         })
         .collect();
 
-    // Each producer has `last_commit: zero` and a non-zero `hinted_commit`,
-    // so the unresolved count is the total producer count across journals.
+    // Each projected producer has `last_commit: zero` and a non-zero
+    // `hinted_commit`, so the unresolved count is the total producer count.
     let unresolved_hints = journals.iter().map(|jf| jf.producers.len()).sum();
     shuffle::Frontier {
         unresolved_hints,
         journals,
         flushed_lsn: vec![],
+    }
+}
+
+/// Producers whose current-round action commits a transaction spanning >= 2
+/// distinct journals (partitions) — the only shape from which production
+/// extracts a causal hint. These are exactly the producers a real recovery
+/// checkpoint could carry as hint-only entries, so only these get a hint
+/// projection (see `project_hints`).
+///
+/// `open_span_partitions` supplies the partition breadth of a span opened by an
+/// earlier `ContinueOnly` and committed now by `CommitOpen`; a `ContinueAck`
+/// commits the partitions it names in the same round. A standalone OUTSIDE is
+/// single-journal, and a rollback ACK document carries no hints — neither
+/// qualifies.
+fn qualifying_hint_producers(
+    actions: &HashMap<ProducerId, Action>,
+    open_span_partitions: &HashMap<ProducerId, HashSet<PartitionId>>,
+) -> HashSet<uuid::Producer> {
+    let mut out = HashSet::new();
+    for (&prod_id, action) in actions {
+        let distinct_partitions = match action {
+            Action::ContinueAck { continues } => {
+                continues.iter().copied().collect::<HashSet<_>>().len()
+            }
+            Action::CommitOpen => open_span_partitions
+                .get(&prod_id)
+                .map_or(0, |partitions| partitions.len()),
+            Action::OutsideTxn { .. }
+            | Action::ContinueOnly { .. }
+            | Action::ContinueRollback { .. } => 0,
+        };
+        if distinct_partitions >= 2 {
+            out.insert(make_producer_id(prod_id));
+        }
+    }
+    out
+}
+
+/// Maintain the set of partitions touched by each producer's currently-open
+/// span, so a later `CommitOpen` (in a subsequent round) knows how many
+/// journals its transaction spans. `ContinueOnly` opens a span; `CommitOpen`
+/// and `ContinueRollback` resolve it. The generator only ever opens a span with
+/// a single `ContinueOnly` (an open producer keeps it open, commits, or rolls
+/// back — never extends), so the recorded set is the span's full breadth.
+fn update_open_spans(
+    open_span_partitions: &mut HashMap<ProducerId, HashSet<PartitionId>>,
+    actions: &HashMap<ProducerId, Action>,
+) {
+    for (&prod_id, action) in actions {
+        match action {
+            Action::ContinueOnly { continues } => {
+                open_span_partitions.insert(prod_id, continues.iter().copied().collect());
+            }
+            Action::CommitOpen | Action::ContinueRollback { .. } => {
+                open_span_partitions.remove(&prod_id);
+            }
+            Action::OutsideTxn { .. } | Action::ContinueAck { .. } => {}
+        }
     }
 }
 
@@ -895,6 +978,11 @@ async fn run_test_case_inner(
         (0..test_case.num_shards).map(|_| None).collect();
     let mut next_round_pre_written = false;
 
+    // Partitions touched by each producer's currently-open span (opened by a
+    // prior ContinueOnly), so a later CommitOpen can be classified as a
+    // multi-journal transaction for hint projection (see project_hints).
+    let mut open_span_partitions: HashMap<ProducerId, HashSet<PartitionId>> = HashMap::new();
+
     for (round_idx, round) in test_case.rounds.iter().enumerate() {
         let is_last = round_idx == test_case.rounds.len() - 1;
 
@@ -980,17 +1068,43 @@ async fn run_test_case_inner(
         }
 
         // STEP 4: PROJECT HINTS INTO RECOVERY.
-        let projection = project_hints(&round_frontier);
+        // Only producers committing a multi-journal ACK_TXN this round can carry
+        // a causal hint in production, so only those project hint-only entries.
+        // The open-span tracker is updated afterward so this round's CommitOpen
+        // is classified against the span its earlier ContinueOnly opened,
+        // before that entry is cleared.
+        let qualifying = qualifying_hint_producers(&round.actions, &open_span_partitions);
+        update_open_spans(&mut open_span_partitions, &round.actions);
+        let projection = project_hints(&round_frontier, &qualifying);
         recovery = recovery.reduce(projection);
 
-        // STEP 5: WRITE NEXT ROUND (if not last).
-        if !is_last {
+        // STEP 5: WRITE NEXT ROUND (if not last and not crashing).
+        //
+        // Pre-writing creates an intentional race on non-crash rounds: the next
+        // round's data is in the journals while this round's frontier gates
+        // scan visibility. On a crash round it is skipped: the resumed session
+        // re-reads everything above the recovered checkpoint and re-commits it
+        // (STEP 6), and pre-written next-round commits would be
+        // indistinguishable from the crash round's own recovered commits now
+        // that hints no longer gate every committed producer.
+        if !is_last && !round.crash {
             let next_round = &test_case.rounds[round_idx + 1];
             write_actions(&mut producers, &next_round.actions).await;
             next_round_pre_written = true;
         }
 
         // STEP 6: MAYBE CRASH AND RESTART.
+        //
+        // Crash-round commits are verified via committed-checkpoint recovery:
+        // the resumed session starts each read at the furthest position its
+        // recovered checkpoint justifies, re-reads everything above it — the
+        // crash round's writes — and re-commits its transactions at their
+        // original clocks. Poll until every committing producer of the crash
+        // round is visible again. When the recovery frontier carries unresolved
+        // hints (this round's multi-journal ACK commits), the pipeline first
+        // emits recovery peeks and then the recovery checkpoint; polling
+        // reduces through them until all hints resolve AND all commits are
+        // visible.
         if round.crash {
             session
                 .close()
@@ -1021,17 +1135,18 @@ async fn run_test_case_inner(
                 unresolved_hints: 0,
             };
 
-            if recovery.unresolved_hints != 0 {
-                // Loop past peeks until the recovery checkpoint fully resolves.
+            if !commit_clocks.is_empty() || recovery.unresolved_hints != 0 {
                 loop {
-                    let recovery_delta = session
+                    let delta = session
                         .next_checkpoint()
                         .await
                         .map_err(|e| format!("recovery next_checkpoint: {e}"))?;
 
-                    round_frontier = round_frontier.reduce(recovery_delta);
+                    round_frontier = round_frontier.reduce(delta);
 
-                    if round_frontier.unresolved_hints == 0 {
+                    if round_frontier.unresolved_hints == 0
+                        && polling_complete(&round_frontier, &commit_clocks)
+                    {
                         break;
                     }
                 }
@@ -1068,10 +1183,137 @@ async fn run_test_case_inner(
 // Quickcheck entry point
 // ---------------------------------------------------------------------------
 
+/// Deterministic regression cases, replayed before the randomized sweep. All
+/// were found by fuzz sweeps while ratifying the span-at-head marker and
+/// hint-fidelity changes, and specifically stress crash recovery of commits
+/// that project no causal hint (single-journal and OUTSIDE commits) alongside
+/// uncommitted spans at journal offset zero (the span-at-head marker).
+fn regression_cases() -> Vec<TestCase> {
+    fn round(actions: Vec<(ProducerId, Action)>, crash: bool) -> Round {
+        Round {
+            actions: actions.into_iter().collect(),
+            crash,
+        }
+    }
+
+    vec![
+        // An OUTSIDE commit plus an open span, crashing in the very first
+        // round: no hints exist, so the resumed session must re-read from the
+        // (empty) recovered checkpoint and re-commit the OUTSIDE.
+        TestCase {
+            num_shards: 3,
+            num_producers: 3,
+            rounds: vec![round(
+                vec![
+                    (0, Action::OutsideTxn { partition: 2 }),
+                    (
+                        1,
+                        Action::ContinueOnly {
+                            continues: vec![4, 2, 4],
+                        },
+                    ),
+                ],
+                true,
+            )],
+        },
+        // A multi-journal ACK commit (hinted), quiet rounds, then a crash whose
+        // only commit is an un-hinted OUTSIDE: it must recover via
+        // committed-checkpoint recovery with prior-round state preserved.
+        TestCase {
+            num_shards: 2,
+            num_producers: 1,
+            rounds: vec![
+                round(
+                    vec![(
+                        0,
+                        Action::ContinueAck {
+                            continues: vec![0, 2, 2],
+                        },
+                    )],
+                    false,
+                ),
+                round(vec![], false),
+                round(vec![], false),
+                round(vec![(0, Action::OutsideTxn { partition: 3 })], true),
+            ],
+        },
+        // Mixed rounds with open spans (candidates for span-at-head markers in
+        // flushed checkpoints), a hint-less rollback of an open span, and a
+        // final crash carrying both a hinted multi-journal commit and an
+        // un-hinted OUTSIDE commit.
+        TestCase {
+            num_shards: 2,
+            num_producers: 4,
+            rounds: vec![
+                round(vec![], false),
+                round(
+                    vec![
+                        (2, Action::ContinueAck { continues: vec![1] }),
+                        (
+                            1,
+                            Action::ContinueOnly {
+                                continues: vec![4, 4, 1],
+                            },
+                        ),
+                        (
+                            3,
+                            Action::ContinueAck {
+                                continues: vec![2, 4, 0],
+                            },
+                        ),
+                        (0, Action::OutsideTxn { partition: 1 }),
+                    ],
+                    false,
+                ),
+                round(
+                    vec![
+                        (2, Action::OutsideTxn { partition: 4 }),
+                        (
+                            0,
+                            Action::ContinueAck {
+                                continues: vec![3, 0, 0],
+                            },
+                        ),
+                        (3, Action::ContinueAck { continues: vec![1] }),
+                    ],
+                    false,
+                ),
+                round(
+                    vec![
+                        (
+                            0,
+                            Action::ContinueAck {
+                                continues: vec![2, 2, 1],
+                            },
+                        ),
+                        (3, Action::OutsideTxn { partition: 4 }),
+                        (
+                            2,
+                            Action::ContinueOnly {
+                                continues: vec![3, 0],
+                            },
+                        ),
+                        (1, Action::ContinueRollback { continues: vec![] }),
+                    ],
+                    true,
+                ),
+            ],
+        },
+    ]
+}
+
 #[test]
 fn fuzz_shuffle_pipeline() {
     // Run quickcheck, catching panics so we can always tear down.
     let result = std::panic::catch_unwind(|| {
+        // Deterministic regressions replay before the randomized sweep.
+        for (idx, case) in regression_cases().into_iter().enumerate() {
+            let result = prop(case);
+            assert!(
+                !result.is_failure(),
+                "deterministic regression case {idx} failed",
+            );
+        }
         quickcheck::QuickCheck::new().quickcheck(prop as fn(TestCase) -> quickcheck::TestResult)
     });
 

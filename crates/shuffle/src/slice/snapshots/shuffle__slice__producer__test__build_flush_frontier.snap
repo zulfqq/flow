@@ -1,5 +1,6 @@
 ---
 source: crates/shuffle/src/slice/producer.rs
+assertion_line: 405
 expression: snap
 ---
 [
@@ -65,7 +66,6 @@ expression: snap
                         last_commit: Clock(0s 32ns),
                         max_continue: Clock(0s 0ns),
                         offset: -1000,
-                        gapped: false,
                     },
                 },
                 pending: {},
@@ -82,7 +82,6 @@ expression: snap
                         last_commit: Clock(0s 16ns),
                         max_continue: Clock(0s 0ns),
                         offset: -500,
-                        gapped: false,
                     },
                 },
                 pending: {},
@@ -180,7 +179,6 @@ expression: snap
                         last_commit: Clock(0s 16ns),
                         max_continue: Clock(0s 0ns),
                         offset: -500,
-                        gapped: false,
                     },
                 },
                 pending: {},
@@ -270,7 +268,6 @@ expression: snap
                         last_commit: Clock(0s 16ns),
                         max_continue: Clock(0s 0ns),
                         offset: -500,
-                        gapped: false,
                     },
                 },
                 pending: {},
@@ -287,13 +284,11 @@ expression: snap
                         last_commit: Clock(0s 32ns),
                         max_continue: Clock(0s 0ns),
                         offset: -1000,
-                        gapped: false,
                     },
                     Producer(05:00:00:00:00:00): ProducerState {
                         last_commit: Clock(0s 8ns),
                         max_continue: Clock(0s 0ns),
                         offset: -200,
-                        gapped: false,
                     },
                 },
                 pending: {},
@@ -367,7 +362,6 @@ expression: snap
                         last_commit: Clock(0s 16ns),
                         max_continue: Clock(0s 0ns),
                         offset: -400,
-                        gapped: false,
                     },
                 },
                 pending: {},
@@ -384,7 +378,6 @@ expression: snap
                         last_commit: Clock(0s 8ns),
                         max_continue: Clock(0s 0ns),
                         offset: -200,
-                        gapped: false,
                     },
                 },
                 pending: {},
@@ -458,7 +451,87 @@ expression: snap
                         last_commit: Clock(0s 8ns),
                         max_continue: Clock(0s 0ns),
                         offset: -300,
-                        gapped: false,
+                    },
+                },
+                pending: {},
+                read_offset: 0,
+                prev_read_offset: 0,
+                write_head: 0,
+                prev_write_head: 0,
+            },
+        ],
+    ),
+    (
+        "span_at_head_marker",
+        Frontier {
+            journals: [
+                JournalFrontier {
+                    journal: "journal/A",
+                    binding: 0,
+                    producers: [
+                        ProducerFrontier {
+                            producer: Producer(01:00:00:00:00:00),
+                            last_commit: Clock(0s 4ns),
+                            hinted_commit: Clock(0s 0ns),
+                            offset: 0,
+                        },
+                        ProducerFrontier {
+                            producer: Producer(03:00:00:00:00:00),
+                            last_commit: Clock(0s 0ns),
+                            hinted_commit: Clock(0s 0ns),
+                            offset: 700,
+                        },
+                        ProducerFrontier {
+                            producer: Producer(05:00:00:00:00:00),
+                            last_commit: Clock(0s 40ns),
+                            hinted_commit: Clock(0s 0ns),
+                            offset: 0,
+                        },
+                    ],
+                    bytes_read_delta: 0,
+                    bytes_behind_delta: 0,
+                },
+                JournalFrontier {
+                    journal: "journal/B",
+                    binding: 0,
+                    producers: [
+                        ProducerFrontier {
+                            producer: Producer(07:00:00:00:00:00),
+                            last_commit: Clock(0s 0ns),
+                            hinted_commit: Clock(0s 24ns),
+                            offset: 0,
+                        },
+                    ],
+                    bytes_read_delta: 0,
+                    bytes_behind_delta: 0,
+                },
+            ],
+            flushed_lsn: [
+                0/0,
+                0/0,
+                0/0,
+            ],
+            unresolved_hints: 1,
+        },
+        [
+            ReadState {
+                binding_index: 0,
+                journal: "journal/A",
+                settled: {
+                    Producer(01:00:00:00:00:00): ProducerState {
+                        last_commit: Clock(0s 0ns),
+                        max_continue: Clock(0s 0ns),
+                        offset: 0,
+                    },
+                    Producer(03:00:00:00:00:00): ProducerState {
+                        last_commit: Clock(0s 0ns),
+                        max_continue: Clock(0s 0ns),
+                        offset: 700,
+                    },
+                    Producer(05:00:00:00:00:00): ProducerState {
+                        last_commit: Clock(0s 40ns),
+                        max_continue: Clock(0s 0ns),
+                        offset: 0,
                     },
                 },
                 pending: {},

@@ -56,33 +56,20 @@ pub struct SliceActor {
     pub parser: simd_doc::SimdParser,
     /// Ordered heap of reads with ready documents.
     pub ready_read_heap: ReadyReadHeap,
-    /// The single active backfill of a gapped producer's pending transaction, if
-    /// any. At most one backfill exists per Slice, globally: triggers are
-    /// discovered only by sequencing the heap top, and a backfill blocks all
-    /// main-read draining until it completes (see `try_log_request_tx`), so no
-    /// second trigger can be reached while one is in flight. It holds the in-flight
-    /// historical read / batch cursor (`BackfillIo`) and the bookkeeping to report
-    /// completion; the reconstructed open span lives in the read's ordinary
-    /// `pending` map, and the trigger stays buffered at the head of its read in the
-    /// ready heap.
+    /// A backfill of a gapped producer's pending transaction, if any.
+    /// A Slice has at most one backfill, which stalls all other reads.
     pub backfill: Option<Backfill>,
     /// Per-task metrics counters and gauges.
     pub metrics: super::Metrics,
 }
 
 impl Drop for SliceActor {
-    /// Balance the `*_started` / `*_stopped` counters at session teardown (clean
-    /// Session EOF or task cancellation). Reads and backfills still running here
-    /// stop by teardown rather than through their normal per-journal paths;
-    /// counting them keeps `started - stopped` a live count that returns to zero
-    /// across sessions sharing a `shard_id` label.
     fn drop(&mut self) {
-        // A backfill's triggering main read stays buffered in the ready heap (its
-        // trigger at the head), so it is counted by `ready_read_heap.len()` — the
-        // backfill's own in-flight historical read is a *backfill*, not a main
-        // read, so it adds nothing to `reads_stopped`.
+        // Reads which were still active at drop (cancellation).
         let live_reads =
             self.pending_probes.len() + self.pending_reads.len() + self.ready_read_heap.len();
+
+        // Ensure that `*_started` / `*_stopped` counters are balanced.
         self.metrics.reads_stopped.increment(live_reads as u64);
         self.metrics
             .backfills_stopped
@@ -218,11 +205,7 @@ impl SliceActor {
                 Some((result, read)) = self.pending_reads.next() => {
                     self.on_pending_read_resolved(result, read)?;
                 }
-                // The in-flight historical read of the single active backfill.
-                // `next_backfill_batch` is pending unless a backfill is actively
-                // `Reading` (not `Draining`, not absent), so this arm never fires
-                // otherwise. It leaves the read in place; a resolved batch
-                // transitions it to `Draining` in `process_backfill_result`.
+                // FIXME: make this an impl of Backfill
                 result = super::gap::next_backfill_batch(&mut self.backfill) => {
                     self.process_backfill_result(result)?;
                 }
@@ -354,14 +337,11 @@ impl SliceActor {
         let journal = spec.name.into_boxed_str();
         let read_id = self.reads.len() as u32;
 
-        // Resolve the checkpoint into producer state and the start offset M: the
-        // checkpoint's furthest justified position. Gapped producers carry their
-        // `gapped` bit set within `producers`, with `offset == F`.
+        // Resolve the checkpoint into producer state and start offset.
         let state::ResolvedCheckpoint { offset, producers } = state::resolve_checkpoint(checkpoint);
 
-        // Emit a diagnostic for each gapped producer, on a "backfill" track
-        // that also surfaces triggered backfills and their completions.
-        for (producer, ps) in producers.iter().filter(|(_, ps)| ps.gapped) {
+        // Emit a diagnostic for each gapped producer.
+        for (producer, ps) in producers.iter().filter(|(_, ps)| ps.is_gapped()) {
             service_kit::event!(
                 tracing::Level::DEBUG,
                 "backfill",
@@ -370,8 +350,8 @@ impl SliceActor {
                 binding = binding.index,
                 journal = journal.to_string(),
                 producer = service_kit::event::debug(*producer),
-                gap_begin = ps.offset, // F
-                start_offset = offset, // M
+                gap_begin = ps.offset,
+                start_offset = offset,
                 "classified producer as gapped on restart",
             );
         }
@@ -569,9 +549,6 @@ impl SliceActor {
                 inner: err,
             }) => match classify_read_failure(err) {
                 ReadFailure::JournalRemoved(status) => {
-                    self.metrics.reads_stopped.increment(1);
-                    // A dead main read has no active backfill (a backfilling read
-                    // is parked outside `pending_reads`).
                     service_kit::event!(
                         tracing::Level::INFO,
                         "read",
@@ -581,6 +558,7 @@ impl SliceActor {
                         "stopped journal read ({})",
                         status.as_str_name(),
                     );
+                    self.metrics.reads_stopped.increment(1);
                     return Ok(());
                 }
                 ReadFailure::Transient(err) => {
@@ -693,27 +671,15 @@ impl SliceActor {
                 }
             }
 
-            // Drain the active backfill's historical batch cursor: recovered
-            // target-producer documents are appended directly, without heap
-            // ordering or tailing / clock-delay gating. This is sound because the
-            // backfill trigger document already cleared those gates, and
-            // backfill'd docs share its binding and strictly precede its clock.
+            // If there's an active backfill, sequence and drain its historical
+            // documents. They append before all heap documents, including the
+            // the backfill trigger (still in the heap).
             if let Some(tx) = self.try_drain_backfill(buffers)? {
                 return Ok(future::Either::Left(tx.reserve_owned().map(ok)));
             }
-
-            // A backfill blocks all main-read → Log I/O for the whole Slice until
-            // it completes. New Log appends while backfilling come only from the
-            // backfill itself (drained above); we do NOT sequence or append any
-            // main-read document of any journal. The trigger was the globally-next
-            // document in (priority DESC, adjusted_clock ASC) order when it parked,
-            // so letting other journals overtake it here would violate the same
-            // live cross-journal ordering the tailing gate enforces — a merely
-            // stalled read head-of-line-blocks the drain, so a parked one must too.
-            // This is also what makes at-most-one backfill per Slice structural:
-            // the heap does not drain while a backfill is active, so no second
-            // trigger can be discovered. Completion re-presents the parked trigger
-            // and the next iteration resumes normal draining.
+            // Stall dequeue of all non-backfill reads while one is underway.
+            // It's documents must append before any later document.
+            // FIXME: have try_drain_backfill return anyhow::Result<(is_still_backfilling: bool, Option<permit_future>)>, and use a match over its returned Ok tuple
             if self.backfill.is_some() {
                 return Ok(idle);
             }
@@ -752,87 +718,38 @@ impl SliceActor {
                 )));
             }
 
-            // Look up the head document's producer state — one pending-else-settled
-            // lookup per document. The decision that follows is pure and mutates
-            // nothing: a normal producer goes through `sequence_producer`; a gapped
-            // producer (whose frozen `max_continue == 0` misleads `uuid::sequence`)
-            // is classified by the `sequence_gapped` table. The caller performs the
-            // I/O and, for a gapped producer, reports the resolution only after the
-            // document is irrevocably consumed below. Sequencing stays AFTER the
-            // clock-delay gate: a backfill's direct historical appends are sound
-            // only because the trigger cleared that gate first.
+            // Retained across the sequence call (`ProducerState` is Copy) for the
+            // post-pop rollback event and, on a trigger, for `start_backfill`,
+            // which needs the recovered `F` and `last_commit` that a speculatively
+            // mutated `sequenced.producer_state` would clobber.
             let producer_state = read_state.producer_state(meta.producer);
+            let was_gapped = producer_state.is_gapped();
 
-            let (sequenced, gapped) = if !producer_state.gapped {
-                let doc =
-                    state::sequence_producer(producer_state, &read_state.journal, binding, &meta)?;
-                (doc, None)
-            } else {
-                let outcome = state::sequence_gapped(producer_state.last_commit, &meta);
-                let doc = match outcome {
-                    state::GappedOutcome::TriggerBackfill => {
-                        // The gapped producer's first newer document (CONTINUE or
-                        // ACK, the heap head): reconstruct its span into `pending`
-                        // and open the bounded historical backfill. The trigger is
-                        // NOT sequenced or popped now — it stays at the heap head.
-                        // `continue` re-enters the loop, which — now that a backfill
-                        // is active — returns idle at the blocking gate above until
-                        // the backfill completes, then re-sequences the trigger
-                        // through this same normal path against the reconstructed
-                        // span (the producer is no longer gapped by then). F is the
-                        // frozen entry's `offset` (freeze invariant).
-                        self.start_backfill(
-                            read_id as u32,
-                            *meta, // Meta is Copy.
-                            producer_state.offset,
-                            producer_state.last_commit,
-                        )?;
-                        continue;
-                    }
-                    // Drop: consume the duplicate with no effect, passing the frozen
-                    // state through unchanged — its `gapped` bit stays set, so the
-                    // `pending.insert` below re-freezes it. Spec §Gapped state
-                    // sanctions such an unchanged flush carrying `(last_commit, F)`.
-                    state::GappedOutcome::Drop => state::SequencedDoc {
-                        is_append: false,
-                        is_commit: false,
-                        producer_state,
-                    },
-                    // Durable rollback: replace positive `F` with a committed
-                    // `-ack_end` and clear the bit, so the gap does not return after
-                    // restart. The negative offset wins by magnitude under Frontier
-                    // reduction even if a base retains a higher (monotonic)
-                    // `last_commit` — matching existing deep-rollback semantics.
-                    // (Reported, and DeepRollback warned, post-pop.)
-                    state::GappedOutcome::CleanRollback | state::GappedOutcome::DeepRollback => {
-                        state::SequencedDoc {
-                            is_append: false,
-                            is_commit: true,
-                            producer_state: super::producer::ProducerState {
-                                last_commit: meta.clock,
-                                max_continue: uuid::Clock::zero(),
-                                offset: -meta.end_offset,
-                                gapped: false,
-                            },
-                        }
-                    }
-                    // A newer OUTSIDE commit resolves the gap: sequence normally
-                    // against the frozen state (its `max_continue == 0` lets
-                    // `OutsideCommit` proceed) and clear the bit on the result.
-                    // (Reported post-pop.)
-                    state::GappedOutcome::OutsideResolve => {
-                        let mut doc = state::sequence_producer(
-                            producer_state,
-                            &read_state.journal,
-                            binding,
-                            &meta,
-                        )?;
-                        doc.producer_state.gapped = false;
-                        doc
-                    }
-                };
-                (doc, Some(outcome))
-            };
+            let sequenced =
+                state::sequence_producer(producer_state, &read_state.journal, binding, &meta)?;
+
+            if sequenced.backfill {
+                // The gapped producer's first newer CONTINUE, ACK, or OUTSIDE (the
+                // heap head) is the backfill trigger. This check MUST precede the
+                // `is_append`/`is_commit` handling below: an ACK trigger reports
+                // `is_commit` but must not extract hints or arm the flush, and a
+                // CONTINUE trigger reports `is_append` but must not append. Instead
+                // reconstruct the recovered open span into `pending` and open the
+                // bounded historical backfill of `[F, trigger.begin)`. The trigger
+                // is neither popped nor state-committed — it stays at the heap head,
+                // the `backfill.is_some()` gate parks the drain, and it is
+                // re-sequenced through this same path against the reconstructed span
+                // (no longer gapped) once the backfill completes. `F` is the frozen
+                // entry's `offset` (freeze invariant); the speculatively mutated
+                // `sequenced.producer_state` is discarded.
+                self.start_backfill(
+                    read_id as u32,
+                    *meta, // Meta is Copy.
+                    producer_state.offset,
+                    producer_state.last_commit,
+                )?;
+                continue;
+            }
 
             // If this is an Append, attempt to send it to the appropriate shard(s).
             if sequenced.is_append {
@@ -873,58 +790,28 @@ impl SliceActor {
                 mut meta_tail,
             } = *ready_read;
 
-            // Report a gapped producer's resolution now that its document is
-            // irrevocably consumed. This MUST fire post-pop, exactly once: an
-            // OutsideResolve with is_append=true can hit a full Log channel before
-            // the pop and be re-sequenced on wake, and because sequencing is pure
-            // (no state mutation) that retry re-derives the identical outcome — so
-            // the resolution event cannot run before the pop. The `gapped` bit
-            // itself is cleared by the `sequenced.producer_state` inserted into
-            // `pending` below (rollback and OUTSIDE both cleared it; a Drop passed
-            // the still-set bit through, and a non-gapped producer `None` has none).
-            // (A TriggerBackfill never reaches here: it `continue`d above.)
-            match gapped {
-                Some(
-                    outcome @ (state::GappedOutcome::CleanRollback
-                    | state::GappedOutcome::DeepRollback),
-                ) => {
-                    let deep = matches!(outcome, state::GappedOutcome::DeepRollback);
-                    if deep {
-                        tracing::warn!(
-                            binding=%binding.state_key(),
-                            clock=?clock,
-                            journal=%read_state.journal,
-                            producer=?producer,
-                            "gapped producer deep-rolled back prior to its last committed clock (possible loss of exactly-once guarantees)",
-                        );
-                    }
-                    service_kit::event!(
-                        tracing::Level::INFO,
-                        "backfill",
-                        session = self.topology.session_id,
-                        read_id,
-                        binding = read_state.binding_index,
-                        journal = read_state.journal.to_string(),
-                        producer = service_kit::event::debug(producer),
-                        clock = service_kit::event::debug(clock),
-                        deep_rollback = deep,
-                        "resolved gap by rollback (no historical I/O)",
-                    );
-                }
-                Some(state::GappedOutcome::OutsideResolve) => {
-                    service_kit::event!(
-                        tracing::Level::INFO,
-                        "backfill",
-                        session = self.topology.session_id,
-                        read_id,
-                        binding = read_state.binding_index,
-                        journal = read_state.journal.to_string(),
-                        producer = service_kit::event::debug(producer),
-                        clock = service_kit::event::debug(clock),
-                        "resolved gap via newer OUTSIDE commit (no historical I/O)",
-                    );
-                }
-                _ => {}
+            // Report a gapped producer's zero-I/O resolution now that its document
+            // is irrevocably consumed. While gapped, only a clean/deep rollback ACK
+            // reaches the pop with `is_commit` set: a *newer* CONTINUE, ACK, or
+            // OUTSIDE became a backfill trigger (which `continue`d above and never
+            // pops), and duplicates drop without committing. It fires post-pop so
+            // it reports at-most-once. `deep` uses the retained pre-sequence
+            // `last_commit`; `sequence_producer`'s `AckDeepRollback` arm already
+            // warns on a deep regression, so no warn is repeated here.
+            if was_gapped && sequenced.is_commit {
+                let deep = clock < producer_state.last_commit;
+                service_kit::event!(
+                    tracing::Level::INFO,
+                    "backfill",
+                    session = self.topology.session_id,
+                    read_id,
+                    binding = read_state.binding_index,
+                    journal = read_state.journal.to_string(),
+                    producer = service_kit::event::debug(producer),
+                    clock = service_kit::event::debug(clock),
+                    deep_rollback = deep,
+                    "resolved gap by rollback (no historical I/O)",
+                );
             }
 
             // Track maximum forward progress of the read.

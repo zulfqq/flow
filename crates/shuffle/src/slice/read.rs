@@ -32,8 +32,9 @@ pub struct ReadState {
 
 impl ReadState {
     /// Construct a `ReadState` from `settled` producers recovered from its
-    /// checkpoint. Gapped producers carry their `gapped` bit set within `settled`
-    /// (see `ProducerState::gapped`); there is no separate gap map.
+    /// checkpoint. Gapped producers carry the `max_continue == last_commit + 1`
+    /// sentinel within `settled` (see `ProducerState::is_gapped`); there is no
+    /// separate gap map.
     pub fn recovered(
         binding_index: u16,
         journal: Box<str>,

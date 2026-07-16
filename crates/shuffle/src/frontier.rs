@@ -2,6 +2,40 @@ use crate::log;
 use proto_flow::shuffle;
 use proto_gazette::uuid::{Clock, Producer};
 
+/// `last_commit` value the flush path persists for a real pending span that
+/// begins at journal offset zero (see `slice::producer::build_flush_frontier`).
+///
+/// SEMANTICALLY LOAD-BEARING — `last_commit` at `offset == 0` disambiguates two
+/// otherwise-identical persisted entries: a real CONTINUE span observed
+/// beginning at journal offset zero, versus a hint-only placeholder (a producer
+/// known only via a causal hint, with NO read-derived position). A hint-only
+/// entry persists `{last_commit: 0, offset: 0}` and is NEVER gapped — it
+/// resumes from `M` like a committed entry, because a hint-only producer implies
+/// every one of its documents lies above `M`. A real span at journal head
+/// persists this marker so `slice::state::resolve_checkpoint` gaps
+/// it exactly as it gaps any uncommitted span whose begin `F` precedes `M`.
+///
+/// Raw clock `1` can never collide with a real commit: a committing clock
+/// derives from wall-clock time and is astronomically larger. This is a
+/// normative axiom, beside the clock-adjacency axiom the in-memory gapped
+/// sentinel rests on. `resolve_checkpoint` normalizes the synthetic marker back
+/// to `Clock::zero()` in live state.
+///
+/// Hint resolution (`JournalFrontier::resolve_hints`) elevates `last_commit` in
+/// place on hint-carrying entries — including a marker entry `{1, H, 0}` — and
+/// that unconditional elevation is deliberate and safe. Elevation fires only
+/// when read-derived progress for the SAME `(journal, binding, producer)` shows
+/// `last_commit > 1`, i.e. the read observed this producer COMMIT in this
+/// journal — which necessarily resolved the span at offset zero (committed or
+/// rolled it back). The elevating flush's `flushed_lsn` rides with the same
+/// checkpoint, so the delivering documents are durably readable with it; a
+/// later recovery from the elevated `{C > 1, 0}` therefore correctly classifies
+/// NOT gapped, and per-producer dedup (`last_commit = C`) drops any re-read
+/// duplicates. No span is lost. (A guard that skipped elevation instead would
+/// wedge such a producer: `unresolved` advances only through elevation, so its
+/// hint could never resolve.)
+pub(crate) const SPAN_AT_HEAD_MARKER: u64 = 1;
+
 /// Frontier state of a single producer within a journal.
 #[derive(Debug, Clone)]
 pub struct ProducerFrontier {
@@ -121,6 +155,17 @@ impl JournalFrontier {
     /// capped at `hinted_commit` but `other.last_commit` is past it,
     /// `other.offset` corresponds to a journal position that overshoots
     /// where our claimed `last_commit` actually sits.
+    ///
+    /// Elevation deliberately applies to a [`SPAN_AT_HEAD_MARKER`] entry
+    /// (`{1, H, 0}`) too, even though `last_commit`-at-offset-zero is a
+    /// load-bearing encoding: `other` is read-derived, so elevation fires only
+    /// when the read observed this same `(journal, binding, producer)` COMMIT —
+    /// which necessarily resolved the span at offset zero — and the elevating
+    /// checkpoint carries the `flushed_lsn` of the delivering documents. The
+    /// next recovery from the elevated `{C > 1, 0}` correctly classifies NOT
+    /// gapped (see the marker constant's docs for the full argument). Skipping
+    /// elevation instead would wedge the hint: `unresolved` advances only
+    /// through this path.
     ///
     /// Returns `(advanced, resolved)`:
     /// - `advanced`: producers whose `last_commit` advanced by any amount.
@@ -630,6 +675,88 @@ mod test {
             let r = pf(0x01, a.0, a.1, a.2).reduce(pf(0x01, b.0, b.1, b.2));
             assert_eq!(pf_tuple(&r), expect, "reduce({a:?}, {b:?})");
         }
+    }
+
+    /// Build a ProducerFrontier with RAW clock values (not seconds), for
+    /// SPAN_AT_HEAD_MARKER cases where the exact raw encoding matters.
+    fn pf_raw(id: u8, last_commit: u64, hinted_commit: u64, offset: i64) -> ProducerFrontier {
+        ProducerFrontier {
+            producer: crate::testing::producer(id),
+            last_commit: Clock::from_u64(last_commit),
+            hinted_commit: Clock::from_u64(hinted_commit),
+            offset,
+        }
+    }
+
+    #[test]
+    fn test_reduce_preserves_span_at_head_marker() {
+        let hint_clock = Clock::from_unix(200, 0).as_u64();
+        let commit_clock = Clock::from_unix(300, 0).as_u64();
+
+        // A marker entry `{1, 0, 0}` (real span at journal head) reduced with a
+        // hint-only entry `{0, H, 0}` keeps the marker in both argument orders:
+        // `max(1, 0) = 1`, and the equal-magnitude offset tie keeps 0. Losing
+        // the marker here would reclassify the span as hint-only on the next
+        // recovery, silently dropping it.
+        let marker = || pf_raw(0x01, SPAN_AT_HEAD_MARKER, 0, 0);
+        let hint = || pf_raw(0x01, 0, hint_clock, 0);
+        for (a, b) in [(marker(), hint()), (hint(), marker())] {
+            let r = a.reduce(b);
+            assert_eq!(
+                r.last_commit.as_u64(),
+                SPAN_AT_HEAD_MARKER,
+                "marker survives a hint merge",
+            );
+            assert_eq!(r.hinted_commit.as_u64(), hint_clock);
+            assert_eq!(r.offset, 0);
+        }
+
+        // Read-derived progress supersedes the marker: a real `last_commit`
+        // wins by max, and the larger offset magnitude wins.
+        let read = || pf_raw(0x01, commit_clock, 0, -500);
+        for (a, b) in [(marker(), read()), (read(), marker())] {
+            let r = a.reduce(b);
+            assert_eq!(r.last_commit.as_u64(), commit_clock);
+            assert_eq!(r.offset, -500);
+        }
+    }
+
+    #[test]
+    fn test_resolve_hints_elevates_span_at_head_marker() {
+        // A marker entry carrying an unresolved hint `{1, H, 0}` IS elevated by
+        // read-derived progress — deliberately (see SPAN_AT_HEAD_MARKER docs):
+        // progress with `last_commit >= H` for the same (journal, binding,
+        // producer) proves the read committed (or rolled back) the offset-zero
+        // span, and the elevated `{H, 0}` then correctly recovers as NOT
+        // gapped. A guard skipping elevation would instead wedge the hint,
+        // since `unresolved` advances only through this path.
+        let hint_clock = Clock::from_unix(200, 0);
+        let mut pending = Frontier {
+            journals: vec![jf(
+                "journal/A",
+                0,
+                vec![pf_raw(0x01, SPAN_AT_HEAD_MARKER, hint_clock.as_u64(), 0)],
+            )],
+            flushed_lsn: vec![],
+            unresolved_hints: 1,
+        };
+        let progressed = Frontier {
+            journals: vec![jf("journal/A", 0, vec![pf(0x01, 250, 0, -800)])],
+            flushed_lsn: vec![],
+            unresolved_hints: 0,
+        };
+
+        let (advanced, resolved) = pending.resolve_hints(&progressed);
+        assert_eq!((advanced, resolved), (1, 1));
+        assert_eq!(
+            pending.journals[0].producers[0].last_commit, hint_clock,
+            "elevated to (and capped at) the hinted commit",
+        );
+        assert_eq!(
+            pending.journals[0].producers[0].offset, 0,
+            "offset untouched, as for any elevation",
+        );
+        assert_eq!(pending.unresolved_hints, 0);
     }
 
     #[test]
